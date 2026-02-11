@@ -1,0 +1,47 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+*.pyd
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# Virtual Environments
+.venv/
+venv/
+env/
+ENV/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
+
+# Local configs
+config.local.yaml
+.env
+
+# Obsidian Vault Output
+vault/
+obsidian_vault/
+
+# Vector DBs
+chroma_data/
+faiss_index/
+*.index
+
+# Temp Processing
+tmp/
+cache/
+processing/
