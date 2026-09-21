@@ -99,5 +99,68 @@ class IndexToQdrantTests(unittest.TestCase):
         self.assertEqual(code, 1)
 
 
+class MainCliAiStructureTests(unittest.TestCase):
+    def setUp(self):
+        self._tmp = TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.root = Path(self._tmp.name)
+        self.state_path = self.root / "sync_state.json"
+
+    def write(self, name, content):
+        p = self.root / name
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(content, encoding="utf-8")
+        return p
+
+    def test_ai_structure_requires_index_flag_at_parser_level(self):
+        import subprocess
+        import sys
+        f = self.write("input/doc.txt", "content")
+        result = subprocess.run(
+            [sys.executable, "main.py", str(f), "--ai-structure"],
+            cwd=str(Path(__file__).resolve().parent.parent),
+            capture_output=True, text=True,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("--ai-structure requires --index", result.stderr)
+
+    def test_index_to_qdrant_ai_structure_flag_reaches_index_local_path(self):
+        from unittest.mock import patch
+        f = self.write("input/doc.txt", "content for the flag-plumbing test")
+        store = make_store()
+        fake_structure_fn = lambda text: type("R", (), {"ok": True, "text": text, "model": "m", "reason": None})()
+        with patch("ingest.sync.index_local_path", wraps=__import__("ingest.sync", fromlist=["index_local_path"]).index_local_path) as spy:
+            index_to_qdrant(str(self.root / "input"), None, self.state_path, store=store,
+                             ai_structure=True, structure_fn=fake_structure_fn)
+            self.assertTrue(spy.called)
+            self.assertTrue(spy.call_args.kwargs.get("ai_structure"))
+            self.assertIs(spy.call_args.kwargs.get("structure_fn"), fake_structure_fn)
+
+    def test_existing_vault_note_is_not_overwritten_when_ai_structure_enabled(self):
+        f = self.write("input/doc.txt", "new content that would structure differently")
+        out_dir = self.root / "vault"
+        out_dir.mkdir()
+        existing_note = out_dir / "doc.md"
+        existing_note.write_text("# Human-authored note\n\nDo not overwrite me.", encoding="utf-8")
+        store = make_store()
+        fake_structure_fn = lambda text: type("R", (), {"ok": True, "text": text, "model": "m", "reason": None})()
+        index_to_qdrant(str(self.root / "input"), str(out_dir), self.state_path, store=store,
+                         ai_structure=True, structure_fn=fake_structure_fn)
+        self.assertEqual(existing_note.read_text(), "# Human-authored note\n\nDo not overwrite me.")
+        # File is still indexed even though the Markdown write was skipped.
+        results = store.search("new content that would structure differently", limit=1)
+        self.assertTrue(results)
+
+    def test_source_file_itself_is_never_modified_or_deleted(self):
+        f = self.write("input/doc.txt", "original untouched content")
+        original_bytes = f.read_bytes()
+        store = make_store()
+        fake_structure_fn = lambda text: type("R", (), {"ok": True, "text": text, "model": "m", "reason": None})()
+        index_to_qdrant(str(self.root / "input"), None, self.state_path, store=store,
+                         ai_structure=True, structure_fn=fake_structure_fn)
+        self.assertTrue(f.exists())
+        self.assertEqual(f.read_bytes(), original_bytes)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -36,7 +36,8 @@ Qdrant is the persistent vector-store layer. Ollama provides the embedding model
 - Incremental vault sync AND incremental local-file ingestion: unchanged content (by sha256) is skipped on repeat runs, tracked in `sync_state.json` under independent `vault`/`local` namespaces so the two sources never collide
 - One bad file in a batch (extraction failure, embedding failure) is reported and skipped — it never aborts the rest of the batch or corrupts the saved state for other files
 - An MCP server (`mcp_server.py`) exposing `semantic_search`, `sync_vault`, and `index_status` as tools, so any MCP client (including Hermes) can query the index directly
-- 51 unit tests covering chunking, storage, Obsidian walking, vault sync, local-file ingestion, namespaced state, and the `main.py` CLI — `python -m unittest discover -s tests`
+- Optional AI structuring of local files (`--ai-structure`): an Ollama chat model reorganizes headings/summary/tags without altering facts, numbers, dates, URLs, or code — fails safe to raw Markdown on any error, timeout, or validation rejection
+- 81 unit tests covering chunking, storage, Obsidian walking, vault sync, local-file ingestion, namespaced state, AI structuring, and the `main.py` CLI — `python -m unittest discover -s tests`
 
 ## Requirements
 
@@ -157,12 +158,43 @@ With `--index`:
 1. Walks the input (single file, or every file under a directory recursively via `utils.fs.iter_files`).
 2. Detects type (`ingest/detect.py`) and extracts text (`ingest/extract.py`); unsupported file types are reported and skipped, not fatal.
 3. Skips any file whose sha256 matches the value recorded for it in `sync_state.json`'s `local` namespace from a previous run (independent from the vault sync's `vault` namespace — the two never collide, even sharing one state file).
-4. For new/changed files: builds Markdown (`ingest/markdown.py`), then calls `VectorStore.index_document` (deletes any of that file's existing chunks, then upserts fresh ones) with `source_file` (absolute path) and `markdown_path` attached to every chunk's payload — so `semantic_search` results can always be traced back to both the original file and the generated note.
-5. If `--out` is given, also writes the generated Markdown there (same `safe_write` helper `main.py` already used).
+4. For new/changed files: builds Markdown (`ingest/markdown.py`), optionally passes the body through AI structuring (see below, `--ai-structure`), then calls `VectorStore.index_document` (deletes any of that file's existing chunks, then upserts fresh ones) with `source_file` (absolute path) and `markdown_path` attached to every chunk's payload — so `semantic_search` results can always be traced back to both the original file and the generated note.
+5. If `--out` is given, also writes the generated Markdown there (same `safe_write` helper `main.py` already used) — unless AI structuring is enabled and a file already exists at that destination path, in which case the write is skipped (the note is still indexed either way) so a human-authored vault note is never silently overwritten.
 6. One bad file (extraction error, embedding/Qdrant error) is reported in the summary and skipped; its state is not updated (so it's retried next run), and it never aborts the rest of the batch.
 7. Prints a summary and exits non-zero if any file errored, so a script/cron job can detect a partial failure.
 
 `ingest.sync.index_local_folder` (the pre-`--index` helper) still exists as a thin backward-compatible wrapper around the new `index_local_path`, for any code still calling it directly.
+
+## Optional AI structuring (`--ai-structure`)
+
+By default, local-file ingestion indexes the raw extracted Markdown — no LLM call, no extra latency, no extra failure mode. Pass `--ai-structure` (only valid together with `--index`) to instead have an Ollama chat model reorganize the document's **body** (title, headings, a short summary, tags, section structure) before it is chunked and embedded. The generated `source:`/`ingested:` frontmatter is never sent to the model and is always reattached afterward — it's ingestion metadata, not source content.
+
+```bash
+python main.py document.pdf --index --ai-structure
+python main.py ./documents --index --ai-structure
+python main.py document.pdf --out ~/obsidian_vault/imports --index --ai-structure
+```
+
+Environment variables (optional):
+
+```bash
+export AI_STRUCTURE_MODEL=gemma4:12b            # default: gemma4:12b
+export AI_STRUCTURE_TIMEOUT_SECONDS=300         # default: 300 (5 min); ignored if non-numeric or <= 0
+```
+
+Timeout precedence: an explicit `timeout=` argument passed programmatically to `structure_markdown()` > `AI_STRUCTURE_TIMEOUT_SECONDS` env var (if set to a valid positive number) > the 300-second default. There is no `--ai-structure-timeout` CLI flag (kept deliberately minimal); the env var is the supported way to raise it further. Real testing on this hardware measured `gemma4:12b` taking 87–142s depending on whether the model was already loaded — 300s leaves comfortable headroom for a cold load.
+
+**Structuring contract** — the model may reorganize headings/summary/tags/Markdown structure, but must not invent facts, remove information, alter numbers/names/dates/commands/URLs/quotes/technical values, fabricate citations, or state uncertain information as certain. `ingest/ai_struct.py` enforces the "no dropped values" half of this mechanically: every run of ≥4 alphanumeric characters from the source body (numbers, identifiers, URL fragments, etc.) must still appear somewhere in the model's output, or the result is rejected.
+
+**Fail-safe by design.** If the model is unreachable, times out, returns empty content, or the output fails the "no dropped source values" check above, ingestion **falls back to the original raw Markdown** and continues — a file is never lost or left half-indexed because structuring failed. The failure reason is printed to the console and recorded per-file in the in-memory report (`structure_reason`); it is not currently persisted into `sync_state.json` after the run (see Remaining gaps in project notes).
+
+**Never touches existing vault notes.** With `--ai-structure` and `--out` both set, if a Markdown file already exists at the destination path, `main.py` skips writing it (the document is still indexed into Qdrant) rather than silently overwriting what may be hand-edited content. This guard is scoped to `--ai-structure`; plain `--index --out` keeps its prior overwrite behavior unchanged.
+
+**Incremental behavior.** A document's indexed state now distinguishes "structuring requested" from "structuring actually succeeded" (`ai_structure_requested` / `ai_structure_succeeded` in `sync_state.json`, plus `structure_model` / `prompt_version`). A document is correctly **skipped** on an unchanged rerun only once structuring has actually *succeeded* for the current model/prompt version — it's never invoked again for a confirmed no-op. But a document whose most recent `--ai-structure` attempt *failed* (timeout, error, or validation rejection) is always eligible for **retry** on the next run, even with a completely unchanged source file — it is never permanently stuck on the raw fallback. Reprocessing is also correctly triggered when: the source file changes, `--ai-structure` is newly turned on for a previously raw-indexed file, or `AI_STRUCTURE_MODEL` changes to a different model (which bumps the recorded `structure_model`). Legacy state entries from before this distinction existed are treated as "not confirmed successful" and get one retry, rather than being trusted blindly.
+
+**Qdrant metadata semantics.** `ai_structured: true` means the indexed text IS the AI-structured version — never merely that structuring was requested. On any fallback to raw Markdown, `ai_structured` is `false` and `structured_sha256` is **not** written at all (a hash of raw content mislabeled as "structured" would be actively misleading). `source_sha256` is always present regardless of structuring outcome.
+
+**This phase is one-directional (files/vault → Qdrant) only.** There is still no Qdrant → Obsidian write-back or automatic modification of existing notes.
 
 ## Semantic search — CLI
 
@@ -230,7 +262,7 @@ Verify with `hermes mcp test knowledge_cortex`, then `/reload-mcp` in an active 
 python -m unittest discover -s tests -v
 ```
 
-51 tests cover chunking (splitting/reconstruction/ID stability/metadata merging), the vector store (upsert/search/reindex/dimension-mismatch/idempotency/metadata payloads, against an in-memory Qdrant instance and a fake Ollama client — no live services required), the Obsidian vault walker (nested directories, exclusion filtering, no infinite loops), the vault sync orchestrator (first run, unchanged-skip, changed-reindex, error isolation), local-file ingestion (single file, recursive directory, unchanged/changed/no-orphans, unsupported files, one-bad-file-does-not-abort-batch, source metadata), namespaced sync-state persistence (vault/local isolation, legacy-format migration), and the `main.py` CLI (default extract-only path unchanged, `--index` path indexing + optional Markdown write + incremental state + nonzero exit on errors).
+95 tests cover chunking (splitting/reconstruction/ID stability/metadata merging), the vector store (upsert/search/reindex/dimension-mismatch/idempotency/metadata payloads, against an in-memory Qdrant instance and a fake Ollama client — no live services required), the Obsidian vault walker (nested directories, exclusion filtering, no infinite loops), the vault sync orchestrator (first run, unchanged-skip, changed-reindex, error isolation), local-file ingestion (single file, recursive directory, unchanged/changed/no-orphans, unsupported files, one-bad-file-does-not-abort-batch, source metadata), namespaced sync-state persistence (vault/local isolation, legacy-format migration), AI structuring (invocation, structured text reaching the store, provenance metadata, safe fallback on request failure, safe fallback on empty/invalid output, incremental skip/reprocess on source-change/flag-toggle/model-change, directory ingestion with structuring enabled, configurable timeout precedence, failed-attempt retry semantics, ai_structured metadata correctness), and the `main.py` CLI (default extract-only path unchanged, `--index` path indexing + optional Markdown write + incremental state + nonzero exit on errors, `--ai-structure` parser validation and plumbing, existing-vault-note protection, source file never modified).
 
 ## Roadmap
 
@@ -250,7 +282,7 @@ python -m unittest discover -s tests -v
 ### Phase 3: Intelligence
 - [x] Obsidian MCP server integration (consume, via `ingest/obsidian_client.py`)
 - [x] Semantic search MCP server (expose, via `mcp_server.py`)
-- [ ] AI-powered structuring (frontmatter, tags, metadata) — `ingest/ai_struct.py` exists but is not wired into the sync path yet
+- [x] AI-powered structuring (frontmatter, tags, metadata) — `ingest/ai_struct.py`, wired into local ingestion via `main.py --index --ai-structure`; opt-in, fails safe to raw Markdown, configurable timeout (`AI_STRUCTURE_TIMEOUT_SECONDS`, default 300s), and failed attempts are automatically retried on the next run rather than getting stuck on the raw fallback permanently.
 - [ ] Bidirectional sync (write AI-generated notes back into the vault via `write_note`/`append_note`)
 - [ ] Hybrid retrieval combining vectors and metadata
 
