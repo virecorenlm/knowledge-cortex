@@ -2,19 +2,31 @@ import os
 import uuid
 from pathlib import Path
 
+import requests
 from qdrant_client import QdrantClient, models
-from sentence_transformers import SentenceTransformer
 
-MODEL_NAME = os.getenv("EMBEDDING_MODEL", "all-MiniLM-L6-v2")
+OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434")
+EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "qwen3-embedding:4b")
 QDRANT_URL = os.getenv("QDRANT_URL", "http://localhost:6333")
 QDRANT_API_KEY = os.getenv("QDRANT_API_KEY")
 QDRANT_COLLECTION = os.getenv("QDRANT_COLLECTION", "knowledge_cortex")
 
-model = SentenceTransformer(MODEL_NAME)
-
 
 def embed_texts(texts):
-    return model.encode(texts, convert_to_numpy=True, normalize_embeddings=True)
+    response = requests.post(
+        f"{OLLAMA_URL.rstrip('/')}/api/embed",
+        json={"model": EMBEDDING_MODEL, "input": texts},
+        timeout=300,
+    )
+    response.raise_for_status()
+    embeddings = response.json()["embeddings"]
+
+    if len(embeddings) != len(texts):
+        raise RuntimeError(
+            f"Ollama returned {len(embeddings)} embeddings for {len(texts)} inputs"
+        )
+
+    return embeddings
 
 
 def get_qdrant_client():
@@ -30,6 +42,18 @@ def ensure_collection(client, vector_size):
                 distance=models.Distance.COSINE,
             ),
         )
+        return
+
+    collection = client.get_collection(QDRANT_COLLECTION)
+    vectors = collection.config.params.vectors
+    existing_size = getattr(vectors, "size", None)
+
+    if existing_size is not None and existing_size != vector_size:
+        raise RuntimeError(
+            f"Qdrant collection '{QDRANT_COLLECTION}' uses {existing_size}-dimensional "
+            f"vectors, but {EMBEDDING_MODEL} returned {vector_size}. Use a new collection "
+            "name or recreate the collection before indexing."
+        )
 
 
 def _point_id(path):
@@ -44,14 +68,20 @@ def generate_links(files):
         return {}
 
     embeddings = embed_texts(texts)
+    vector_size = len(embeddings[0])
+
     client = get_qdrant_client()
-    ensure_collection(client, embeddings.shape[1])
+    ensure_collection(client, vector_size)
 
     points = [
         models.PointStruct(
             id=_point_id(path),
-            vector=embedding.tolist(),
-            payload={"path": path, "text": text},
+            vector=embedding,
+            payload={
+                "path": path,
+                "text": text,
+                "embedding_model": EMBEDDING_MODEL,
+            },
         )
         for path, text, embedding in zip(files, texts, embeddings)
     ]
@@ -66,7 +96,7 @@ def generate_links(files):
     for path, embedding in zip(files, embeddings):
         result = client.query_points(
             collection_name=QDRANT_COLLECTION,
-            query=embedding.tolist(),
+            query=embedding,
             limit=6,
             with_payload=True,
         ).points
