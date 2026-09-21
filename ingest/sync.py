@@ -93,7 +93,7 @@ def index_local_path(store, path, state=None, max_chars=1200, markdown_prefix="l
     from pathlib import Path
     from ingest.detect import detect_file_type
     from ingest.extract import extract_text
-    from ingest.markdown import to_markdown
+    from ingest.markdown import to_markdown, split_frontmatter
     from utils.fs import iter_files
 
     if structure_fn is None:
@@ -132,6 +132,7 @@ def index_local_path(store, path, state=None, max_chars=1200, markdown_prefix="l
             prior_requested = False
             prior_succeeded = False
             prior_prompt_version = None
+            prior_has_cached_body = False
         else:
             prior_digest = prior.get("source_sha256")
             if "ai_structure_requested" in prior:
@@ -146,17 +147,30 @@ def index_local_path(store, path, state=None, max_chars=1200, markdown_prefix="l
                 prior_requested = bool(prior.get("ai_structure"))
                 prior_succeeded = False
             prior_prompt_version = prior.get("prompt_version")
+            # "generated_body" (the deterministic document body, minus the
+            # ingestion frontmatter -- see below) is what --write-vault
+            # reuses to verify/update the managed vault note WITHOUT
+            # rerunning extraction or (expensive) AI structuring when
+            # Qdrant itself skips an unchanged file. Older state written
+            # before this field existed won't have it; treat that as "not
+            # yet cacheable" so the file gets one forced reprocess to
+            # populate it, exactly like the prompt_version-mismatch case
+            # above -- not a special-cased skip condition, just another
+            # instance of the same "prior state is insufficient" pattern.
+            prior_has_cached_body = "generated_body" in prior
 
         # Skip only when: the source content is unchanged, the ai_structure
-        # on/off setting matches the last run, AND (if structuring is on)
-        # the previous attempt actually SUCCEEDED with the current
-        # prompt/contract version. A previous attempt that requested
-        # structuring but fell back to raw Markdown (prior_succeeded is
-        # False) is never considered "unchanged" — it is always retried,
-        # so a document can't get permanently stuck raw just because one
-        # run happened to time out or fail validation.
+        # on/off setting matches the last run, the previous attempt actually
+        # SUCCEEDED (if structuring is on) with the current prompt/contract
+        # version, AND a cached generated_body is available for vault
+        # write-back reuse. A previous attempt that requested structuring
+        # but fell back to raw Markdown (prior_succeeded is False) is never
+        # considered "unchanged" — it is always retried, so a document
+        # can't get permanently stuck raw just because one run happened to
+        # time out or fail validation.
         if (prior_digest == source_digest and prior_requested == bool(ai_structure)
-                and (not ai_structure or (prior_succeeded and prior_prompt_version == PROMPT_VERSION))):
+                and (not ai_structure or (prior_succeeded and prior_prompt_version == PROMPT_VERSION))
+                and prior_has_cached_body):
             report["skipped_unchanged"].append(abs_path)
             continue
 
@@ -182,6 +196,15 @@ def index_local_path(store, path, state=None, max_chars=1200, markdown_prefix="l
                 indexed_text = md
 
             markdown_path = f"{markdown_prefix}/{Path(file).name}"
+            # document_body is the ACTUAL document content, with the
+            # ingestion frontmatter (source:/ingested:) stripped off. This
+            # is what gets reused for --write-vault: the managed note's
+            # body should be the document itself, not a second stacked
+            # frontmatter block. What gets chunked/embedded into Qdrant
+            # (indexed_text) is unchanged and still includes the ingestion
+            # frontmatter -- this only affects what a future write-vault
+            # stage receives as the note body.
+            _, document_body = split_frontmatter(indexed_text)
             metadata = {
                 "source_file": abs_path,
                 "markdown_path": markdown_path,
@@ -213,10 +236,17 @@ def index_local_path(store, path, state=None, max_chars=1200, markdown_prefix="l
             "ai_structure_succeeded": bool(ai_structure and structured_ok),
             "structure_model": model_for_state if ai_structure else None,
             "prompt_version": PROMPT_VERSION if ai_structure else None,
+            # Cached so --write-vault can verify/update the managed note on
+            # a run where Qdrant itself skips this file as unchanged,
+            # without re-extracting the source or re-invoking (possibly
+            # expensive) AI structuring. See the skip-condition comment
+            # above for why its absence forces one reprocess.
+            "generated_body": document_body,
         }
         report["indexed"].append({
             "source_file": abs_path, "markdown_path": markdown_path,
             "chunk_count": len(chunks), "markdown": indexed_text,
+            "document_body": document_body,
             "ai_structured": bool(ai_structure and structured_ok),
             "structure_model": model_for_state if ai_structure else None,
             "structure_reason": structure_reason,

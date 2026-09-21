@@ -456,5 +456,64 @@ class DigestHelperSanity(unittest.TestCase):
         self.assertEqual(a, b)
 
 
+class GeneratedBodyCachingTests(unittest.TestCase):
+    """Hardening pass: index_local_path caches a document_body (report) /
+    generated_body (state) with the ingestion frontmatter already stripped,
+    so --write-vault can verify/update a managed note on a run where this
+    file is skipped as unchanged, without re-extracting or re-structuring."""
+
+    def setUp(self):
+        self._tmp = TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.root = Path(self._tmp.name)
+
+    def write(self, name, content):
+        p = self.root / name
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(content, encoding="utf-8")
+        return p
+
+    def test_indexed_entry_includes_document_body_without_ingestion_frontmatter(self):
+        f = self.write("doc.txt", "content for body-caching test")
+        store = make_store()
+        report, _ = index_local_path(store, str(f), state={})
+        entry = report["indexed"][0]
+        self.assertIn("document_body", entry)
+        self.assertNotIn("source:", entry["document_body"])
+        self.assertNotIn("ingested:", entry["document_body"])
+        self.assertIn("content for body-caching test", entry["document_body"])
+        # "markdown" (used by --out) is untouched and still has the frontmatter.
+        self.assertIn("source:", entry["markdown"])
+
+    def test_state_caches_generated_body_for_reuse_on_skip(self):
+        f = self.write("doc.txt", "stable content for state caching")
+        store = make_store()
+        _, state = index_local_path(store, str(f), state={})
+        entry = state[str(f.resolve())]
+        self.assertIn("generated_body", entry)
+        self.assertNotIn("source:", entry["generated_body"])
+        self.assertIn("stable content for state caching", entry["generated_body"])
+
+    def test_state_missing_cached_body_forces_one_reprocess(self):
+        # Simulates state written before generated_body existed.
+        f = self.write("doc.txt", "content with pre-caching legacy state")
+        store = make_store()
+        from ingest.markdown import to_markdown
+        source_digest = hashlib.sha256(f.read_text().encode("utf-8")).hexdigest()
+        legacy_state = {
+            str(f.resolve()): {
+                "source_sha256": source_digest,
+                "ai_structure_requested": False,
+                "ai_structure_succeeded": False,
+                "structure_model": None,
+                "prompt_version": None,
+                # no "generated_body" key -- pre-hardening-pass state
+            }
+        }
+        report, state = index_local_path(store, str(f), state=legacy_state)
+        self.assertEqual(len(report["indexed"]), 1)  # forced reprocess, not skipped
+        self.assertIn("generated_body", state[str(f.resolve())])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -25,7 +25,8 @@ def extract_to_markdown(input_path, out_dir):
         safe_write(md, file, out_dir)
 
 
-def index_to_qdrant(input_path, out_dir, state_path, store=None, ai_structure=False, structure_fn=None):
+def index_to_qdrant(input_path, out_dir, state_path, store=None, ai_structure=False, structure_fn=None,
+                     write_vault=False, managed_vault_dir=None, obsidian=None):
     """New behavior (--index): extract + chunk + embed + upsert into the
     same Qdrant collection VectorStore/sync_cli use, via
     ingest.sync.index_local_path — no duplicated extraction, chunking, or
@@ -48,6 +49,25 @@ def index_to_qdrant(input_path, out_dir, state_path, store=None, ai_structure=Fa
     index_local_path (for tests / alternate providers); defaults to
     ingest.ai_struct.structure_markdown.
 
+    write_vault: when True (opt-in, independent of --out — --out writes
+    plain local Markdown files with no conflict protection; write_vault
+    writes into the LIVE Obsidian vault via the managed, conflict-safe path
+    in ingest/vault_writer.py), every successfully indexed entry from this
+    run is also written to a dedicated managed subtree of the vault
+    (managed_vault_dir). A note is only ever created/updated there if it
+    can be proven cortex-owned and unmodified since cortex's last write;
+    otherwise the attempt is reported as a conflict and the vault note is
+    left untouched. Requires network access to the Obsidian MCP server;
+    genuine connection/auth failures are reported per-entry like any other
+    error and do not abort the rest of the batch.
+
+    managed_vault_dir: destination subtree for write_vault (default:
+    "Knowledge Cortex/Managed"). Only used when write_vault is True.
+
+    obsidian: optional pre-built ObsidianClient (for tests); defaults to
+    ObsidianClient() reading OBSIDIAN_MCP_URL/OBSIDIAN_MCP_AUTHORIZATION
+    from the environment. Only used when write_vault is True.
+
     store: optional pre-built VectorStore (for tests); defaults to
     VectorStore() reading OLLAMA_URL/EMBEDDING_MODEL/QDRANT_URL/QDRANT_COLLECTION
     from the environment, same as sync_cli.py.
@@ -61,6 +81,73 @@ def index_to_qdrant(input_path, out_dir, state_path, store=None, ai_structure=Fa
     state = load_state(state_path, namespace="local")
     report, state = index_local_path(store, input_path, state=state, ai_structure=ai_structure,
                                       structure_fn=structure_fn)
+
+    vault_results = []
+    if write_vault:
+        import asyncio
+        from ingest.vault_writer import write_managed_note, source_id_for
+        from ingest.obsidian_client import ObsidianClient
+
+        managed_vault_dir = (managed_vault_dir or "Knowledge Cortex/Managed").rstrip("/")
+        client = obsidian or ObsidianClient()
+
+        # Vault write-back is decoupled from Qdrant's own unchanged-skip:
+        # a source that Qdrant skipped (no re-extraction, no re-structuring,
+        # no re-embedding) still gets its managed vault note verified/
+        # written when --write-vault is explicitly requested, using the
+        # generated_body cached in state by index_local_path — never by
+        # re-running extraction or AI structuring. This is what makes the
+        # "human edited the vault note; source never changed" conflict
+        # detectable without forcing an unnecessary Qdrant reindex.
+        vault_candidates = list(report["indexed"])
+        for source_file in report["skipped_unchanged"]:
+            cached = state.get(source_file, {})
+            cached_body = cached.get("generated_body")
+            if cached_body is None:
+                # Should not happen (index_local_path only skips when a
+                # cached body is present), but never attempt a vault write
+                # with no known content -- skip resiliently instead.
+                continue
+            vault_candidates.append({
+                "source_file": source_file,
+                "markdown": cached_body,
+                "document_body": cached_body,
+                "structure_model": cached.get("structure_model"),
+            })
+
+        async def _write_all():
+            results = []
+            for entry in vault_candidates:
+                source_id = source_id_for(entry["source_file"])
+                basename = Path(entry["source_file"]).stem
+                dest_path = f"{managed_vault_dir}/{basename}-{source_id}.md"
+                state_entry = state.get(entry["source_file"], {})
+                metadata = {
+                    "source_path": entry["source_file"],
+                    "source_sha256": state_entry.get("source_sha256", ""),
+                    "prompt_version": state_entry.get("prompt_version"),
+                    "structure_model": entry.get("structure_model"),
+                }
+                body = entry.get("document_body", entry["markdown"])
+                try:
+                    result = await write_managed_note(client, dest_path, body, metadata)
+                except Exception as exc:  # noqa: BLE001 - report, don't abort the batch
+                    result = {"status": "error", "path": dest_path, "reason": str(exc), "generated_sha256": None}
+                result["source_file"] = entry["source_file"]
+                # Record the outcome in local state for observability/debugging only —
+                # the vault note itself remains the sole authority for conflict
+                # detection on the NEXT run (see ingest/vault_writer.py's module
+                # docstring); state is never consulted to decide whether a write is
+                # safe, so a stale or deleted state file cannot cause an unsafe write.
+                state.setdefault(entry["source_file"], {})["vault_write"] = {
+                    "dest_path": dest_path, "status": result["status"],
+                    "generated_sha256": result["generated_sha256"],
+                }
+                results.append(result)
+            return results
+
+        vault_results = asyncio.run(_write_all())
+
     save_state(state_path, state, namespace="local")
 
     skipped_existing_notes = []
@@ -79,6 +166,12 @@ def index_to_qdrant(input_path, out_dir, state_path, store=None, ai_structure=Fa
             else:
                 print("Writing markdown for:", entry["source_file"])
                 safe_write(entry["markdown"], entry["source_file"], out_dir)
+    for result in vault_results:
+        label = {"created": "Vault: created", "updated": "Vault: updated",
+                  "skipped": "Vault: unchanged, skipped", "conflict": "Vault CONFLICT (not written)",
+                  "error": "Vault ERROR"}[result["status"]]
+        suffix = f" ({result['reason']})" if result.get("reason") else ""
+        print(f"  {label}: {result['path']}{suffix}")
     for path in report["skipped_unchanged"]:
         print("Unchanged, skipped:", path)
     for path in report["skipped_unsupported"]:
@@ -88,13 +181,17 @@ def index_to_qdrant(input_path, out_dir, state_path, store=None, ai_structure=Fa
     for err in report["errors"]:
         print("ERROR:", err["path"], "-", err["error"])
 
+    conflict_count = sum(1 for r in vault_results if r["status"] == "conflict")
+    vault_error_count = sum(1 for r in vault_results if r["status"] == "error")
     print()
     print(f"Indexed {len(report['indexed'])} file(s) into Qdrant collection "
           f"'{store.collection}' using {store.embedding_model} "
           f"({len(report['skipped_unchanged'])} unchanged, "
           f"{len(report['errors'])} error(s), "
-          f"{len(skipped_existing_notes)} existing note(s) not overwritten).")
-    return 1 if report["errors"] else 0
+          f"{len(skipped_existing_notes)} existing note(s) not overwritten"
+          + (f", {conflict_count} vault conflict(s), {vault_error_count} vault error(s)"
+             if write_vault else "") + ").")
+    return 1 if (report["errors"] or vault_error_count) else 0
 
 
 def main():
@@ -113,15 +210,28 @@ def main():
                               "pass (headings/summary/tags) before chunking/indexing. Opt-in; falls "
                               "back safely to raw Markdown if structuring fails or produces invalid "
                               "output. See ingest/ai_struct.py for the structuring contract.")
+    parser.add_argument("--write-vault", action="store_true", dest="write_vault",
+                         help="Requires --index. Also write each indexed document into a dedicated "
+                              "managed subtree of the live Obsidian vault (see --managed-vault-dir), "
+                              "via a conflict-safe path that refuses to touch any note it cannot "
+                              "prove it owns and last wrote unmodified. Independent of --out, which "
+                              "writes plain local files with no conflict protection. See "
+                              "ingest/vault_writer.py for the ownership/conflict model.")
+    parser.add_argument("--managed-vault-dir", default=None, dest="managed_vault_dir",
+                         help="Destination subtree inside the vault for --write-vault "
+                              "(default: 'Knowledge Cortex/Managed'). Only used with --write-vault.")
     parser.add_argument("--state", type=Path, default=Path(__file__).with_name("sync_state.json"),
                          help="Path to the shared sync state file (default: sync_state.json)")
     args = parser.parse_args()
 
     if args.ai_structure and not args.index:
         parser.error("--ai-structure requires --index")
+    if args.write_vault and not args.index:
+        parser.error("--write-vault requires --index")
 
     if args.index:
-        return index_to_qdrant(args.input, args.out, args.state, ai_structure=args.ai_structure)
+        return index_to_qdrant(args.input, args.out, args.state, ai_structure=args.ai_structure,
+                                write_vault=args.write_vault, managed_vault_dir=args.managed_vault_dir)
 
     out_dir = args.out or "vault"
     extract_to_markdown(args.input, out_dir)

@@ -162,5 +162,204 @@ class MainCliAiStructureTests(unittest.TestCase):
         self.assertEqual(f.read_bytes(), original_bytes)
 
 
+class MainCliWriteVaultTests(unittest.TestCase):
+    """--write-vault: opt-in, requires --index, no live MCP server needed
+    (an in-memory FakeObsidian is injected)."""
+
+    def setUp(self):
+        self._tmp = TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.root = Path(self._tmp.name)
+        self.state_path = self.root / "sync_state.json"
+
+    def write(self, name, content):
+        p = self.root / name
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(content, encoding="utf-8")
+        return p
+
+    def test_write_vault_requires_index_flag_at_parser_level(self):
+        import subprocess
+        import sys
+        f = self.write("input/doc.txt", "content")
+        result = subprocess.run(
+            [sys.executable, "main.py", str(f), "--write-vault"],
+            cwd=str(Path(__file__).resolve().parent.parent),
+            capture_output=True, text=True,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("--write-vault requires --index", result.stderr)
+
+    def test_write_vault_is_opt_in_indexing_without_it_never_touches_obsidian(self):
+        from tests.test_vault_writer import FakeObsidian
+        self.write("input/doc.txt", "content indexed without vault write-back")
+        store = make_store()
+        ob = FakeObsidian()
+        code = index_to_qdrant(str(self.root / "input"), None, self.state_path, store=store, obsidian=ob)
+        self.assertEqual(code, 0)
+        self.assertEqual(ob.files, {})  # nothing written; write_vault was never even consulted
+
+    def test_write_vault_creates_a_managed_note_for_each_indexed_file(self):
+        from tests.test_vault_writer import FakeObsidian
+        self.write("input/doc.txt", "content that should land in the managed vault subtree")
+        store = make_store()
+        ob = FakeObsidian()
+        code = index_to_qdrant(str(self.root / "input"), None, self.state_path, store=store,
+                                write_vault=True, obsidian=ob)
+        self.assertEqual(code, 0)
+        self.assertEqual(len(ob.files), 1)
+        dest_path = next(iter(ob.files))
+        self.assertTrue(dest_path.startswith("Knowledge Cortex/Managed/"))
+        self.assertIn("content that should land in the managed vault subtree", ob.files[dest_path])
+
+    def test_write_vault_conflict_is_reported_and_does_not_error_the_batch(self):
+        from tests.test_vault_writer import FakeObsidian, source_id_for
+        f = self.write("input/doc.txt", "content that will conflict")
+        store = make_store()
+        source_id = source_id_for(str(f.resolve()))
+        dest_path = f"Knowledge Cortex/Managed/doc-{source_id}.md"
+        ob = FakeObsidian(files={dest_path: "# A human-authored note already lives here"})
+        code = index_to_qdrant(str(self.root / "input"), None, self.state_path, store=store,
+                                write_vault=True, obsidian=ob)
+        self.assertEqual(code, 0)  # a vault conflict is reported, not treated as a fatal error
+        self.assertEqual(ob.files[dest_path], "# A human-authored note already lives here")
+
+    def test_custom_managed_vault_dir_is_respected(self):
+        from tests.test_vault_writer import FakeObsidian
+        self.write("input/doc.txt", "content for a custom destination")
+        store = make_store()
+        ob = FakeObsidian()
+        index_to_qdrant(str(self.root / "input"), None, self.state_path, store=store,
+                         write_vault=True, managed_vault_dir="Custom/Spot", obsidian=ob)
+        dest_path = next(iter(ob.files))
+        self.assertTrue(dest_path.startswith("Custom/Spot/"))
+
+    def test_unchanged_source_and_unchanged_managed_note_reports_skip_with_no_rewrite(self):
+        from tests.test_vault_writer import FakeObsidian
+        f = self.write("input/doc.txt", "stable content across two write-vault runs")
+        store = make_store()
+        ob = FakeObsidian()
+        index_to_qdrant(str(self.root / "input"), None, self.state_path, store=store,
+                         write_vault=True, obsidian=ob)
+        writes_after_first_run = len(ob.write_calls)
+
+        code = index_to_qdrant(str(self.root / "input"), None, self.state_path, store=store,
+                                write_vault=True, obsidian=ob)
+        self.assertEqual(code, 0)
+        self.assertEqual(len(ob.write_calls), writes_after_first_run)  # no rewrite occurred
+
+    def test_unchanged_source_but_human_edited_note_is_still_checked_and_reports_conflict(self):
+        """The scenario the hardening pass targets: Qdrant must skip (no
+        re-extraction/re-structuring/re-embedding) while the vault layer
+        STILL inspects and correctly flags the human edit as a conflict,
+        using the cached generated_body rather than reprocessing the file."""
+        from tests.test_vault_writer import FakeObsidian
+        f = self.write("input/doc.txt", "content that a human will later edit in the vault")
+        store = make_store()
+        ob = FakeObsidian()
+        index_to_qdrant(str(self.root / "input"), None, self.state_path, store=store,
+                         write_vault=True, obsidian=ob)
+        dest_path = next(iter(ob.files))
+
+        # Simulate a human edit directly in the vault note.
+        from ingest.vault_writer import _parse_frontmatter
+        content = ob.files[dest_path]
+        _, body = _parse_frontmatter(content)
+        ob.files[dest_path] = content.replace(body.strip(), "A human edited this note directly.")
+
+        # Source file is completely untouched -- Qdrant must skip it.
+        import subprocess
+        code = index_to_qdrant(str(self.root / "input"), None, self.state_path, store=store,
+                                write_vault=True, obsidian=ob)
+        self.assertEqual(code, 0)  # a vault conflict is reported, not a fatal error
+        # Human edit must survive untouched.
+        self.assertIn("A human edited this note directly.", ob.files[dest_path])
+
+    def test_unchanged_source_but_deleted_managed_note_is_recreated(self):
+        """Missing-note semantics: if the managed note at cortex's own
+        deterministic path no longer exists, --write-vault recreates it
+        (there is nothing there that could be a human's content to lose)
+        rather than treating "missing" as a permanent block."""
+        from tests.test_vault_writer import FakeObsidian
+        f = self.write("input/doc.txt", "content whose managed note gets deleted")
+        store = make_store()
+        ob = FakeObsidian()
+        index_to_qdrant(str(self.root / "input"), None, self.state_path, store=store,
+                         write_vault=True, obsidian=ob)
+        dest_path = next(iter(ob.files))
+        del ob.files[dest_path]  # simulate deletion of the managed note
+
+        code = index_to_qdrant(str(self.root / "input"), None, self.state_path, store=store,
+                                write_vault=True, obsidian=ob)
+        self.assertEqual(code, 0)
+        self.assertIn(dest_path, ob.files)  # recreated
+        self.assertIn("content whose managed note gets deleted", ob.files[dest_path])
+
+    def test_generated_content_unchanged_but_volatile_timestamp_differs_no_false_conflict(self):
+        """cortex_last_write changes on every write; that alone must never
+        cause a false conflict or false update on an otherwise-identical
+        unchanged run."""
+        from tests.test_vault_writer import FakeObsidian
+        f = self.write("input/doc.txt", "content whose timestamp will differ across runs")
+        store = make_store()
+        ob = FakeObsidian()
+        index_to_qdrant(str(self.root / "input"), None, self.state_path, store=store,
+                         write_vault=True, obsidian=ob)
+        dest_path = next(iter(ob.files))
+        first_write_count = len(ob.write_calls)
+
+        import time
+        time.sleep(0.01)  # ensure a real wall-clock difference is possible
+        code = index_to_qdrant(str(self.root / "input"), None, self.state_path, store=store,
+                                write_vault=True, obsidian=ob)
+        self.assertEqual(code, 0)
+        self.assertEqual(len(ob.write_calls), first_write_count)  # skipped, not rewritten as "updated"
+
+    def test_changed_source_still_replaces_qdrant_chunks_and_safely_updates_vault(self):
+        from tests.test_vault_writer import FakeObsidian
+        f = self.write("input/doc.txt", "version one of the content")
+        store = make_store()
+        ob = FakeObsidian()
+        index_to_qdrant(str(self.root / "input"), None, self.state_path, store=store,
+                         write_vault=True, obsidian=ob)
+        dest_path = next(iter(ob.files))
+
+        f.write_text("version two of the content, completely different now", encoding="utf-8")
+        code = index_to_qdrant(str(self.root / "input"), None, self.state_path, store=store,
+                                write_vault=True, obsidian=ob)
+        self.assertEqual(code, 0)
+        self.assertIn("version two of the content", ob.files[dest_path])
+        points, _ = store.client.scroll(collection_name="main_cli_test", limit=100, with_payload=True)
+        texts = [p.payload["text"] for p in points if p.payload["path"].endswith("doc.txt")]
+        self.assertEqual(len(texts), 1)  # no orphaned chunk from version one
+
+    def test_one_conflict_in_a_directory_does_not_block_other_files_write_vault(self):
+        from tests.test_vault_writer import FakeObsidian
+        self.write("input/a.txt", "first document, will conflict")
+        self.write("input/b.txt", "second document, unrelated and fine")
+        store = make_store()
+        ob = FakeObsidian()
+        index_to_qdrant(str(self.root / "input"), None, self.state_path, store=store,
+                         write_vault=True, obsidian=ob)
+        self.assertEqual(len(ob.files), 2)
+        dest_a = next(p for p in ob.files if "a-" in p)
+
+        # Human-edit note "a" only.
+        from ingest.vault_writer import _parse_frontmatter
+        content = ob.files[dest_a]
+        _, body = _parse_frontmatter(content)
+        ob.files[dest_a] = content.replace(body.strip(), "human edit on file a only")
+
+        # Force reprocessing of both by changing both sources.
+        (self.root / "input" / "a.txt").write_text("first document, changed content", encoding="utf-8")
+        (self.root / "input" / "b.txt").write_text("second document, changed content too", encoding="utf-8")
+        code = index_to_qdrant(str(self.root / "input"), None, self.state_path, store=store,
+                                write_vault=True, obsidian=ob)
+        self.assertEqual(code, 0)
+        self.assertIn("human edit on file a only", ob.files[dest_a])  # conflict preserved human content
+        dest_b = next(p for p in ob.files if "b-" in p)
+        self.assertIn("second document, changed content too", ob.files[dest_b])  # unrelated write succeeded
+
+
 if __name__ == "__main__":
     unittest.main()

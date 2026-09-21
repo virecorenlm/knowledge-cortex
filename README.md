@@ -196,6 +196,54 @@ Timeout precedence: an explicit `timeout=` argument passed programmatically to `
 
 **This phase is one-directional (files/vault → Qdrant) only.** There is still no Qdrant → Obsidian write-back or automatic modification of existing notes.
 
+## Managed Obsidian write-back (`--write-vault`)
+
+By default, `--index` never writes to the live Obsidian vault at all — only `--out` writes plain local Markdown files (with the existing-file guard described above), and those are files on disk, not vault notes. Pass `--write-vault` (only valid together with `--index`) to also create/update a note in the **live** vault for each successfully indexed document, through a conflict-safe managed path (`ingest/vault_writer.py`) rather than a raw overwrite.
+
+```bash
+python main.py document.pdf --index --write-vault
+python main.py document.pdf --index --ai-structure --write-vault
+python main.py ./documents --index --write-vault --managed-vault-dir "Knowledge Cortex/Managed"
+```
+
+**Ownership model.** knowledge-cortex only ever creates or updates a note it can positively prove it owns. Every managed note carries flat frontmatter (matching `ingest/markdown.py`'s existing style — no nested/list YAML):
+
+```yaml
+cortex_managed: true
+cortex_source_id: <12-hex sha256 of the absolute source path>
+cortex_source_path: <absolute path to the original local file>
+cortex_source_sha256: <sha256 of the extracted source text>
+cortex_generated_sha256: <sha256 of THIS note's body, excluding frontmatter>
+cortex_last_write: <ISO timestamp of this write>
+cortex_prompt_version: <ai_struct.PROMPT_VERSION if AI-structured, else empty>
+cortex_structure_model: <model name if AI-structured, else empty>
+```
+
+**Destination.** Generated notes land in a dedicated managed subtree, `Knowledge Cortex/Managed/` by default (override with `--managed-vault-dir`) — never anywhere else in the vault. Filenames are `<source-basename>-<cortex_source_id>.md`, so renaming the source file doesn't orphan the destination note (the id is derived from the absolute path at ingest time, stable across reruns).
+
+**Conflict rules** — a write is only ever applied when it's provably safe:
+| Case | Vault state | Result |
+|---|---|---|
+| A | note doesn't exist | create |
+| B | note exists, not `cortex_managed` | **conflict** — refuse to overwrite |
+| C | note exists, managed, current body hash matches the hash cortex last recorded | safe update |
+| D | note exists, managed, but current body hash has changed (human edit) since cortex last wrote it | **conflict** — refuse to overwrite |
+| E | generated content is identical to what's already there | skip (no write at all) |
+
+**Human edits always win.** Cases B and D never overwrite; they're reported (printed per-entry, e.g. `Vault CONFLICT (not written): <path> (<reason>)`) so you can review and merge manually. There is no automatic conflict resolution in this phase.
+
+**Conflict-detection algorithm.** The live vault note is the sole authority for conflict detection — not `sync_state.json`. Every write records `cortex_generated_sha256 = sha256(body)`, hashed over the note's body **only**, deliberately excluding the frontmatter block. Excluding the frontmatter is what avoids a self-referential hashing bug: `cortex_last_write` changes on every write, and `cortex_generated_sha256` is itself stored inside the frontmatter it would otherwise be hashing — if the whole file were hashed, the "unchanged" comparison could never be satisfied even when nothing meaningful changed. On the next write attempt, the live note is re-read, its body re-hashed, and compared against the recorded `cortex_generated_sha256`: a match means nothing has touched the note since cortex wrote it (safe to update); a mismatch means something else changed it (conflict).
+
+**One frontmatter block only.** A managed note contains exactly one `---`-delimited frontmatter block — the cortex ownership block above. `ingest/markdown.py`'s ingestion frontmatter (`source:`/`ingested:`) is deliberately **not** carried into the managed note body (it would otherwise nest a second frontmatter-looking block inside the first one's content). `ingest/markdown.split_frontmatter()` strips it before the body ever reaches `write_managed_note`; its two fields are subsumed by `cortex_source_path` and `cortex_last_write` respectively. The generated-content hash (`cortex_generated_sha256`) is therefore computed purely over the actual document text — the AI-structured or raw body — never over any ingestion timestamp, so an unchanged document never looks changed just because it was re-extracted at a different wall-clock time.
+
+**Qdrant indexing and vault write-back are independent decisions.** Whether a source needs re-extraction/re-structuring/re-embedding into Qdrant, and whether its managed vault note needs to be checked/written, are decoupled: an unchanged source is still skipped by Qdrant's own incremental logic (no wasted extraction/AI-structuring/embedding), but when `--write-vault` is explicitly passed, the vault note is still verified using a `generated_body` cached in `sync_state.json` from the last time this source WAS processed — never by re-running extraction or (possibly expensive) AI structuring just to check a note. Concretely: if a human edits a managed note while its source is completely unchanged, rerunning with `--write-vault` correctly reports `Unchanged, skipped: <source>` for Qdrant **and** `Vault CONFLICT (not written): <path>` for the vault layer in the same run — the human edit is detected and preserved without any unnecessary reindexing.
+
+**Missing managed note on an unchanged source.** If a previously-created managed note is deleted (by a human or otherwise) while its source is unchanged, the next `--write-vault` run **recreates** it rather than treating "missing" as a permanent block. Rationale: the destination path is itself a cortex-owned, deterministic identifier (`<basename>-<cortex_source_id>.md`); an absent note at cortex's own designated path cannot be human content that needs protecting, so recreating it is the same "safe create" as the very first run — not an unsafe overwrite of anything.
+
+**Why the vault, not local state, is authoritative:** `sync_state.json` can be deleted, copied between machines, or fall out of sync with the vault; the vault itself is the one place both a human editor and knowledge-cortex actually write, so it's the only reliable place to detect a human edit. `sync_state.json` does still record the last vault-write outcome per source file (`vault_write: {dest_path, status, generated_sha256}`), but purely for observability/debugging — it is never consulted to decide whether a write is safe.
+
+**No deletes, no renames, no reverse sync in this phase.** `ingest/obsidian_client.py` only wraps `vault_list`/`vault_read`/`vault_write`/`vault_append`; it does not currently wrap the Obsidian MCP server's `vault_move`/`vault_delete`/`vault_patch` tools (those exist server-side but aren't used here — deliberately, since this phase is scoped to create/update only). There is no vault → source-file reverse synchronization, no automatic conflict merge, and no background watcher; write-back only happens when `--write-vault` is explicitly passed on a `--index` run.
+
 ## Semantic search — CLI
 
 ```python
@@ -262,7 +310,7 @@ Verify with `hermes mcp test knowledge_cortex`, then `/reload-mcp` in an active 
 python -m unittest discover -s tests -v
 ```
 
-95 tests cover chunking (splitting/reconstruction/ID stability/metadata merging), the vector store (upsert/search/reindex/dimension-mismatch/idempotency/metadata payloads, against an in-memory Qdrant instance and a fake Ollama client — no live services required), the Obsidian vault walker (nested directories, exclusion filtering, no infinite loops), the vault sync orchestrator (first run, unchanged-skip, changed-reindex, error isolation), local-file ingestion (single file, recursive directory, unchanged/changed/no-orphans, unsupported files, one-bad-file-does-not-abort-batch, source metadata), namespaced sync-state persistence (vault/local isolation, legacy-format migration), AI structuring (invocation, structured text reaching the store, provenance metadata, safe fallback on request failure, safe fallback on empty/invalid output, incremental skip/reprocess on source-change/flag-toggle/model-change, directory ingestion with structuring enabled, configurable timeout precedence, failed-attempt retry semantics, ai_structured metadata correctness), and the `main.py` CLI (default extract-only path unchanged, `--index` path indexing + optional Markdown write + incremental state + nonzero exit on errors, `--ai-structure` parser validation and plumbing, existing-vault-note protection, source file never modified).
+128 tests cover chunking (splitting/reconstruction/ID stability/metadata merging), the vector store (upsert/search/reindex/dimension-mismatch/idempotency/metadata payloads, against an in-memory Qdrant instance and a fake Ollama client — no live services required), the Obsidian vault walker (nested directories, exclusion filtering, no infinite loops), the vault sync orchestrator (first run, unchanged-skip, changed-reindex, error isolation), local-file ingestion (single file, recursive directory, unchanged/changed/no-orphans, unsupported files, one-bad-file-does-not-abort-batch, source metadata), namespaced sync-state persistence (vault/local isolation, legacy-format migration), AI structuring (invocation, structured text reaching the store, provenance metadata, safe fallback on request failure, safe fallback on empty/invalid output, incremental skip/reprocess on source-change/flag-toggle/model-change, directory ingestion with structuring enabled, configurable timeout precedence, failed-attempt retry semantics, ai_structured metadata correctness), managed vault write-back (create/conflict/safe-update/human-edit-detection/skip-on-unchanged/frontmatter-provenance/hash-excludes-frontmatter, all against an in-memory fake Obsidian client), and the `main.py` CLI (default extract-only path unchanged, `--index` path indexing + optional Markdown write + incremental state + nonzero exit on errors, `--ai-structure` parser validation and plumbing, existing-vault-note protection, source file never modified, `--write-vault` opt-in/conflict-reporting/custom-destination).
 
 ## Roadmap
 
@@ -283,7 +331,8 @@ python -m unittest discover -s tests -v
 - [x] Obsidian MCP server integration (consume, via `ingest/obsidian_client.py`)
 - [x] Semantic search MCP server (expose, via `mcp_server.py`)
 - [x] AI-powered structuring (frontmatter, tags, metadata) — `ingest/ai_struct.py`, wired into local ingestion via `main.py --index --ai-structure`; opt-in, fails safe to raw Markdown, configurable timeout (`AI_STRUCTURE_TIMEOUT_SECONDS`, default 300s), and failed attempts are automatically retried on the next run rather than getting stuck on the raw fallback permanently.
-- [ ] Bidirectional sync (write AI-generated notes back into the vault via `write_note`/`append_note`)
+- [x] Managed, conflict-safe one-way write-back into a dedicated vault subtree (`ingest/vault_writer.py`, `main.py --index --write-vault`) — never overwrites a note it can't prove it owns and last wrote unmodified; human edits always win. Still one-directional only.
+- [ ] Full bidirectional sync (vault → source-file reverse sync, automatic conflict merge, rename/delete propagation)
 - [ ] Hybrid retrieval combining vectors and metadata
 
 ### Phase 4: Cognitive Infrastructure
