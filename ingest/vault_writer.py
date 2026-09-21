@@ -115,6 +115,16 @@ async def _note_exists(obsidian, path):
     return name in entries
 
 
+# Public aliases for the private helpers above, for reuse by other modules
+# needing the EXACT same frontmatter/hash contract without duplicating it
+# (e.g. ingest/reverse_analyzer.py, which must classify a note's state
+# using the identical body-hash and frontmatter-parsing rules write-back
+# uses, rather than a second, potentially-drifting implementation).
+parse_frontmatter = _parse_frontmatter
+hash_managed_body = _hash_body
+note_exists = _note_exists
+
+
 async def write_managed_note(obsidian, dest_path, generated_body, metadata):
     """Attempt a managed, conflict-safe write of `generated_body` to
     `dest_path` in the vault.

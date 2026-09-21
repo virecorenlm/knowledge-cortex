@@ -194,11 +194,73 @@ def index_to_qdrant(input_path, out_dir, state_path, store=None, ai_structure=Fa
     return 1 if (report["errors"] or vault_error_count) else 0
 
 
+def analyze_vault(state_path, source=None, json_output=False, max_diff_lines=200, obsidian=None):
+    """Read-only entry point for `--analyze-vault`. Loads the "local"
+    namespace of sync_state.json (never writes it back), analyzes every
+    managed note found there (or just `source` if given) via
+    ingest.reverse_analyzer.analyze_managed_notes, and prints results.
+
+    Performs ZERO writes: no Obsidian write, no state save, no Qdrant
+    access at all (VectorStore is never imported here). This is strictly
+    an inspection/dry-run path -- see ingest/reverse_analyzer.py's module
+    docstring for the full authority/classification model.
+
+    obsidian: optional pre-built ObsidianClient (for tests); defaults to
+    ObsidianClient() reading OBSIDIAN_MCP_URL/OBSIDIAN_MCP_AUTHORIZATION
+    from the environment.
+
+    Returns 0 always on a completed analysis run (a note being in a
+    non-IN_SYNC state is information, not a process failure); returns 1
+    only if the state file itself could not be read at all.
+    """
+    import asyncio
+    import json as json_module
+    from ingest.obsidian_client import ObsidianClient
+    from ingest.reverse_analyzer import analyze_managed_notes
+    from sync_cli import load_state
+
+    try:
+        state = load_state(state_path, namespace="local")
+    except Exception as exc:  # noqa: BLE001 - report clearly, don't crash
+        print(f"ERROR: could not read state file {state_path}: {exc}")
+        return 1
+
+    client = obsidian or ObsidianClient()
+    results = asyncio.run(analyze_managed_notes(client, state, source_filter=source,
+                                                 max_diff_lines=max_diff_lines))
+
+    if json_output:
+        print(json_module.dumps(results, indent=2))
+        return 0
+
+    if not results:
+        print("No managed notes found in state (nothing has been written via --write-vault yet).")
+        return 0
+
+    for r in results:
+        print(f"[{r['classification']}] {r['source_path']}")
+        print(f"  managed note: {r.get('managed_note_path')}")
+        print(f"  reason: {r.get('reason')}")
+        print(f"  proposed action: {r.get('proposed_action')}")
+        flags = r.get("flags") or {}
+        active_flags = [k for k, v in flags.items() if v]
+        if active_flags:
+            print(f"  flags: {', '.join(active_flags)}")
+        if r.get("diff"):
+            print("  diff (cortex_generated -> vault_current):")
+            for line in r["diff"]:
+                print(f"    {line}")
+            if r.get("diff_truncated"):
+                print(f"    ... truncated ({r['diff_total_lines']} total diff lines)")
+        print()
+    return 0
+
+
 def main():
     from pathlib import Path
 
     parser = argparse.ArgumentParser(description="Neural ingestion → Obsidian vault (+ optional Qdrant indexing)")
-    parser.add_argument("input", help="Input file or folder")
+    parser.add_argument("input", nargs="?", default=None, help="Input file or folder (not used with --analyze-vault)")
     parser.add_argument("--out", default=None,
                          help="Output Obsidian vault folder for generated Markdown (optional with --index)")
     parser.add_argument("--index", action="store_true",
@@ -220,9 +282,31 @@ def main():
     parser.add_argument("--managed-vault-dir", default=None, dest="managed_vault_dir",
                          help="Destination subtree inside the vault for --write-vault "
                               "(default: 'Knowledge Cortex/Managed'). Only used with --write-vault.")
+    parser.add_argument("--analyze-vault", action="store_true", dest="analyze_vault",
+                         help="READ-ONLY: classify every managed note's sync state (IN_SYNC, "
+                              "HUMAN_MODIFIED, MISSING, etc.) against the last cortex-generated "
+                              "body cached in sync_state.json. Makes zero writes to Obsidian, "
+                              "sync_state.json, or Qdrant. Does not require the 'input' argument. "
+                              "See ingest/reverse_analyzer.py for the classification model.")
+    parser.add_argument("--source", default=None,
+                         help="With --analyze-vault: only analyze this one source path "
+                              "(must match a key in sync_state.json's local namespace exactly).")
+    parser.add_argument("--json", action="store_true", dest="json_output",
+                         help="With --analyze-vault: print machine-readable JSON instead of "
+                              "human-readable text.")
+    parser.add_argument("--max-diff-lines", type=int, default=200, dest="max_diff_lines",
+                         help="With --analyze-vault: truncate unified diffs for HUMAN_MODIFIED "
+                              "notes after this many lines (default: 200).")
     parser.add_argument("--state", type=Path, default=Path(__file__).with_name("sync_state.json"),
                          help="Path to the shared sync state file (default: sync_state.json)")
     args = parser.parse_args()
+
+    if args.analyze_vault:
+        return analyze_vault(args.state, source=args.source, json_output=args.json_output,
+                              max_diff_lines=args.max_diff_lines)
+
+    if args.input is None:
+        parser.error("the following arguments are required: input (unless --analyze-vault is given)")
 
     if args.ai_structure and not args.index:
         parser.error("--ai-structure requires --index")

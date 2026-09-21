@@ -244,6 +244,49 @@ cortex_structure_model: <model name if AI-structured, else empty>
 
 **No deletes, no renames, no reverse sync in this phase.** `ingest/obsidian_client.py` only wraps `vault_list`/`vault_read`/`vault_write`/`vault_append`; it does not currently wrap the Obsidian MCP server's `vault_move`/`vault_delete`/`vault_patch` tools (those exist server-side but aren't used here — deliberately, since this phase is scoped to create/update only). There is no vault → source-file reverse synchronization, no automatic conflict merge, and no background watcher; write-back only happens when `--write-vault` is explicitly passed on a `--index` run.
 
+## Read-only reverse-sync analyzer (`--analyze-vault`)
+
+`--write-vault` only ever writes forward (source → vault); it has no way to tell you when a managed note has drifted from what cortex last generated. `--analyze-vault` fills that gap **without writing anything**: it inspects every managed note recorded in `sync_state.json`, classifies its current state, and reports a diff and a non-executing proposed action — a diagnostic pass, not an editor.
+
+```bash
+python main.py --analyze-vault                       # human-readable report, all managed notes
+python main.py --analyze-vault --json                 # machine-readable JSON
+python main.py --analyze-vault --source /path/to/file.pdf   # just one source
+python main.py --analyze-vault --max-diff-lines 500    # raise the diff truncation limit (default 200)
+```
+
+`--analyze-vault` does not take the `input` positional argument and does not require `--index`; it only reads `sync_state.json` and the live vault.
+
+**This is preparation for a future, still-unbuilt, human-approved reverse sync** — this analyzer only detects and reports divergence; it never applies anything. There is currently no code path anywhere in this project that writes a vault note's content back into the source file.
+
+**Authority model** (three independent sources of truth, compared against each other, never merged automatically):
+- the **live vault note** is authority for what currently exists in Obsidian
+- **`sync_state.json`**'s cached `generated_body` (from `ingest/sync.py`'s local-ingestion state — reused directly, no second content cache) is the record of what cortex last generated/knew
+- the **source file on disk** is authority for whether the underlying source currently exists and whether it has changed
+
+**Classifications** (first-match precedence; secondary conditions are still surfaced as `flags` even when not the primary classification):
+
+| Order | Classification | Meaning |
+|---|---|---|
+| 1 | `INVALID_MANAGED_NOTE` | Note claims `cortex_managed: true` but its provenance frontmatter is malformed, missing required fields, or internally inconsistent (e.g. `cortex_source_id` doesn't match the source path on file). Checked first: an untrustworthy note makes any further comparison meaningless. |
+| 2 | `UNMANAGED_AT_TARGET` | A note exists at the expected deterministic path but isn't marked cortex-managed. |
+| 3 | `MISSING` | No note exists at the expected path at all. |
+| 4 | `ANALYSIS_INSUFFICIENT_STATE` | The note is valid and cortex-managed, but state has no cached `generated_body` for this source (e.g. pre-dates that field) — genuinely can't say IN_SYNC vs HUMAN_MODIFIED without a guess, so it doesn't guess. |
+| 5 | `HUMAN_MODIFIED` | Live vault body hash differs from the last cortex-generated body hash. |
+| 6 | `SOURCE_MISSING` | The recorded source file no longer exists on disk. |
+| 7 | `SOURCE_CHANGED` | The source file's current content hash differs from what was recorded when the managed note was last generated — reported only; **never triggers reprocessing**. |
+| 8 | `IN_SYNC` | Vault body matches the last generated body; source unchanged and present. |
+
+Precedence rationale: provenance problems are checked before any content comparison; among content-comparison outcomes, a human edit in the vault (`HUMAN_MODIFIED`) is surfaced ahead of a source-side change (`SOURCE_CHANGED`/`SOURCE_MISSING`) because it's the more urgent, harder-to-recover-from divergence — but source-side flags are still reported (`flags: {source_changed, source_missing}`) even when `HUMAN_MODIFIED` is the primary classification, so nothing is hidden.
+
+**Human-edit detection reuses the write-back hash contract exactly** (`ingest/vault_writer.py`'s `_hash_body`/`_parse_frontmatter`, exposed as `hash_managed_body`/`parse_frontmatter` for this reuse) — the comparison is over the note's body only, never the frontmatter, so a changed `cortex_last_write` timestamp alone can never produce a false `HUMAN_MODIFIED`.
+
+**Diffs** are generated with Python's `difflib.unified_diff` between the cached `generated_body` and the live vault body, for `HUMAN_MODIFIED` notes only. Truncated to `--max-diff-lines` (default 200) with `diff_truncated`/`diff_total_lines` reported so truncation is never silent.
+
+**Proposed actions are labels only** — `none`, `review_human_changes`, `recreate_missing_managed_note`, `investigate_provenance`, `source_changed_reprocess_required`, `source_missing_review_required`, `reprocess_required`. The analyzer never performs any of them.
+
+**Zero writes, guaranteed by construction:** `analyze_managed_notes` only ever calls `obsidian.list_dir` and `obsidian.read_note` — `write_note`/`append_note` are never imported or called anywhere in `ingest/reverse_analyzer.py`. It never imports `VectorStore` (no Qdrant access at all), never calls `sync_cli.save_state`, and never writes to a source file (source re-extraction happens purely in memory, for hashing).
+
 ## Semantic search — CLI
 
 ```python
@@ -310,7 +353,7 @@ Verify with `hermes mcp test knowledge_cortex`, then `/reload-mcp` in an active 
 python -m unittest discover -s tests -v
 ```
 
-128 tests cover chunking (splitting/reconstruction/ID stability/metadata merging), the vector store (upsert/search/reindex/dimension-mismatch/idempotency/metadata payloads, against an in-memory Qdrant instance and a fake Ollama client — no live services required), the Obsidian vault walker (nested directories, exclusion filtering, no infinite loops), the vault sync orchestrator (first run, unchanged-skip, changed-reindex, error isolation), local-file ingestion (single file, recursive directory, unchanged/changed/no-orphans, unsupported files, one-bad-file-does-not-abort-batch, source metadata), namespaced sync-state persistence (vault/local isolation, legacy-format migration), AI structuring (invocation, structured text reaching the store, provenance metadata, safe fallback on request failure, safe fallback on empty/invalid output, incremental skip/reprocess on source-change/flag-toggle/model-change, directory ingestion with structuring enabled, configurable timeout precedence, failed-attempt retry semantics, ai_structured metadata correctness), managed vault write-back (create/conflict/safe-update/human-edit-detection/skip-on-unchanged/frontmatter-provenance/hash-excludes-frontmatter, all against an in-memory fake Obsidian client), and the `main.py` CLI (default extract-only path unchanged, `--index` path indexing + optional Markdown write + incremental state + nonzero exit on errors, `--ai-structure` parser validation and plumbing, existing-vault-note protection, source file never modified, `--write-vault` opt-in/conflict-reporting/custom-destination).
+152 tests cover chunking (splitting/reconstruction/ID stability/metadata merging), the vector store (upsert/search/reindex/dimension-mismatch/idempotency/metadata payloads, against an in-memory Qdrant instance and a fake Ollama client — no live services required), the Obsidian vault walker (nested directories, exclusion filtering, no infinite loops), the vault sync orchestrator (first run, unchanged-skip, changed-reindex, error isolation), local-file ingestion (single file, recursive directory, unchanged/changed/no-orphans, unsupported files, one-bad-file-does-not-abort-batch, source metadata), namespaced sync-state persistence (vault/local isolation, legacy-format migration), AI structuring (invocation, structured text reaching the store, provenance metadata, safe fallback on request failure, safe fallback on empty/invalid output, incremental skip/reprocess on source-change/flag-toggle/model-change, directory ingestion with structuring enabled, configurable timeout precedence, failed-attempt retry semantics, ai_structured metadata correctness), managed vault write-back (create/conflict/safe-update/human-edit-detection/skip-on-unchanged/frontmatter-provenance/hash-excludes-frontmatter, all against an in-memory fake Obsidian client), the read-only reverse-sync analyzer (all 8 classifications, diff generation and truncation, precedence, zero-writes-to-vault/source/state, multiple-notes-in-one-run, one-invalid-note-does-not-block-others, legacy-state safe classification), and the `main.py` CLI (default extract-only path unchanged, `--index` path indexing + optional Markdown write + incremental state + nonzero exit on errors, `--ai-structure` parser validation and plumbing, existing-vault-note protection, source file never modified, `--write-vault` opt-in/conflict-reporting/custom-destination, `--analyze-vault` zero-writes/JSON-output/source-filter).
 
 ## Roadmap
 
@@ -332,6 +375,7 @@ python -m unittest discover -s tests -v
 - [x] Semantic search MCP server (expose, via `mcp_server.py`)
 - [x] AI-powered structuring (frontmatter, tags, metadata) — `ingest/ai_struct.py`, wired into local ingestion via `main.py --index --ai-structure`; opt-in, fails safe to raw Markdown, configurable timeout (`AI_STRUCTURE_TIMEOUT_SECONDS`, default 300s), and failed attempts are automatically retried on the next run rather than getting stuck on the raw fallback permanently.
 - [x] Managed, conflict-safe one-way write-back into a dedicated vault subtree (`ingest/vault_writer.py`, `main.py --index --write-vault`) — never overwrites a note it can't prove it owns and last wrote unmodified; human edits always win. Still one-directional only.
+- [x] Read-only reverse-sync analyzer (`ingest/reverse_analyzer.py`, `main.py --analyze-vault`) — classifies every managed note (IN_SYNC/HUMAN_MODIFIED/MISSING/UNMANAGED_AT_TARGET/SOURCE_CHANGED/SOURCE_MISSING/INVALID_MANAGED_NOTE/ANALYSIS_INSUFFICIENT_STATE) with a diff and proposed action; makes zero writes anywhere. Preparation for, not implementation of, bidirectional sync.
 - [ ] Full bidirectional sync (vault → source-file reverse sync, automatic conflict merge, rename/delete propagation)
 - [ ] Hybrid retrieval combining vectors and metadata
 

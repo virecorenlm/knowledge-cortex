@@ -5,7 +5,7 @@ from tempfile import TemporaryDirectory
 from qdrant_client import QdrantClient
 
 from graph.store import VectorStore
-from main import extract_to_markdown, index_to_qdrant
+from main import extract_to_markdown, index_to_qdrant, analyze_vault
 
 
 class FakeOllama:
@@ -359,6 +359,84 @@ class MainCliWriteVaultTests(unittest.TestCase):
         self.assertIn("human edit on file a only", ob.files[dest_a])  # conflict preserved human content
         dest_b = next(p for p in ob.files if "b-" in p)
         self.assertIn("second document, changed content too", ob.files[dest_b])  # unrelated write succeeded
+
+
+class MainCliAnalyzeVaultTests(unittest.TestCase):
+    """--analyze-vault: read-only, makes zero writes to Obsidian/state/Qdrant."""
+
+    def setUp(self):
+        self._tmp = TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.root = Path(self._tmp.name)
+        self.state_path = self.root / "sync_state.json"
+
+    def write(self, name, content):
+        p = self.root / name
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(content, encoding="utf-8")
+        return p
+
+    def _seed_managed_note(self):
+        from tests.test_vault_writer import FakeObsidian
+        f = self.write("input/doc.txt", "content for analyze-vault CLI test")
+        store = make_store()
+        ob = FakeObsidian()
+        index_to_qdrant(str(self.root / "input"), None, self.state_path, store=store,
+                         write_vault=True, obsidian=ob)
+        return ob
+
+    def test_analyze_vault_reports_in_sync_and_makes_zero_writes(self):
+        ob = self._seed_managed_note()
+        state_before = self.state_path.read_bytes()
+        vault_files_before = dict(ob.files)
+        writes_before = len(ob.write_calls)
+
+        code = analyze_vault(self.state_path, obsidian=ob)
+        self.assertEqual(code, 0)
+        self.assertEqual(self.state_path.read_bytes(), state_before)  # byte-for-byte unchanged
+        self.assertEqual(ob.files, vault_files_before)
+        self.assertEqual(len(ob.write_calls), writes_before)  # zero additional writes
+
+    def test_analyze_vault_json_output_is_valid_json(self):
+        import io
+        import json
+        from contextlib import redirect_stdout
+        ob = self._seed_managed_note()
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            code = analyze_vault(self.state_path, json_output=True, obsidian=ob)
+        self.assertEqual(code, 0)
+        parsed = json.loads(buf.getvalue())
+        self.assertEqual(len(parsed), 1)
+        self.assertEqual(parsed[0]["classification"], "IN_SYNC")
+
+    def test_analyze_vault_source_filter(self):
+        from tests.test_vault_writer import FakeObsidian
+        self.write("input/a.txt", "first source for filter test")
+        self.write("input/b.txt", "second source for filter test")
+        store = make_store()
+        ob = FakeObsidian()
+        index_to_qdrant(str(self.root / "input"), None, self.state_path, store=store,
+                         write_vault=True, obsidian=ob)
+        import io, json
+        from contextlib import redirect_stdout
+        a_path = str((self.root / "input" / "a.txt").resolve())
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            analyze_vault(self.state_path, source=a_path, json_output=True, obsidian=ob)
+        parsed = json.loads(buf.getvalue())
+        self.assertEqual(len(parsed), 1)
+        self.assertEqual(parsed[0]["source_path"], a_path)
+
+    def test_analyze_vault_no_managed_notes_reports_cleanly(self):
+        from tests.test_vault_writer import FakeObsidian
+        ob = FakeObsidian()
+        # An index-only run with no --write-vault leaves nothing to analyze.
+        self.write("input/doc.txt", "content never write-vaulted")
+        store = make_store()
+        index_to_qdrant(str(self.root / "input"), None, self.state_path, store=store)
+        code = analyze_vault(self.state_path, obsidian=ob)
+        self.assertEqual(code, 0)
 
 
 if __name__ == "__main__":
