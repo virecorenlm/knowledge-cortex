@@ -3,7 +3,8 @@ from docx import Document
 
 def extract_text(path, ftype):
     if ftype == "txt" or ftype == "md":
-        return open(path, "r", encoding="utf-8", errors="ignore").read()
+        with open(path, "r", encoding="utf-8", errors="ignore") as f:
+            return f.read()
 
     if ftype == "pdf":
         reader = PdfReader(path)

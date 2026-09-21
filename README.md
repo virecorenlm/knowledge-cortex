@@ -22,20 +22,21 @@ Qdrant (cosine similarity vector store)
 Semantic search — via CLI, or via the knowledge-cortex MCP server tools
 ```
 
-Local files (PDF/DOCX/TXT) can also be extracted, converted to Markdown, and indexed the same way — see `ingest/sync.py:index_local_folder`.
+Local files (PDF/DOCX/TXT/Markdown) enter the same pipeline via `main.py --index`: extract → chunk → embed → upsert, using the identical `VectorStore`/`ingest/chunk.py` code path as the vault sync — see below.
 
 Qdrant is the persistent vector-store layer. Ollama provides the embedding model. ChromaDB and the old in-process FAISS index are not used.
 
 ## Current Features
 
 - Recursive Obsidian vault walking over MCP (`ingest/obsidian_client.py`)
-- Local-file ingestion: TXT, PDF, DOCX, and Markdown extraction (`ingest/extract.py`)
-- Deterministic, content-hash-derived chunk IDs (`ingest/chunk.py`) — re-indexing unchanged content is a no-op; changed content replaces old chunks instead of leaving orphans
+- Local-file ingestion: TXT, PDF, DOCX, and Markdown extraction (`ingest/extract.py`), wired directly into the Qdrant index via `main.py --index` (single file or recursive directory)
+- Deterministic, content-hash-derived chunk IDs (`ingest/chunk.py`) — re-indexing unchanged content is a no-op; changed content replaces old chunks instead of leaving orphans. Chunks accept arbitrary extra payload metadata (e.g. `source_file`, `markdown_path`)
 - Ollama-backed embeddings with `qwen3-embedding:4b` (2560 dimensions, 40,960-token context) — swap via `EMBEDDING_MODEL`
 - Qdrant-backed vector storage with vector-size validation, so an accidental embedding-model mismatch fails loudly instead of corrupting a collection
-- Incremental vault sync: unchanged notes (by sha256) are skipped on repeat runs, tracked in `sync_state.json`
+- Incremental vault sync AND incremental local-file ingestion: unchanged content (by sha256) is skipped on repeat runs, tracked in `sync_state.json` under independent `vault`/`local` namespaces so the two sources never collide
+- One bad file in a batch (extraction failure, embedding failure) is reported and skipped — it never aborts the rest of the batch or corrupts the saved state for other files
 - An MCP server (`mcp_server.py`) exposing `semantic_search`, `sync_vault`, and `index_status` as tools, so any MCP client (including Hermes) can query the index directly
-- 25 unit tests covering chunking, storage, Obsidian walking, and sync — `python -m unittest discover -s tests`
+- 51 unit tests covering chunking, storage, Obsidian walking, vault sync, local-file ingestion, namespaced state, and the `main.py` CLI — `python -m unittest discover -s tests`
 
 ## Requirements
 
@@ -125,13 +126,43 @@ Each run:
 4. For every new or changed note, deletes its old chunks (if any) and upserts the new ones — so a shrunk or rewritten note never leaves stale chunks behind.
 5. Writes an updated `sync_state.json` and prints a JSON summary (`indexed_count`, `skipped_unchanged_count`, `errors`).
 
-## Local-file ingestion (PDF/DOCX/TXT → Obsidian markdown)
+## Local-file ingestion (PDF/DOCX/TXT/Markdown → Obsidian markdown, optionally indexed into Qdrant)
+
+Default behavior (unchanged, no embedding/Qdrant involved — extract only):
 
 ```bash
 python main.py <input_folder> --out <obsidian_vault>
 ```
 
-This crawls the input folder, extracts content, and writes structured Markdown into the target vault folder. To also index the extracted content directly into Qdrant without a separate vault round-trip, use `ingest.sync.index_local_folder` from Python — see its docstring.
+This crawls the input folder, extracts content, and writes structured Markdown into the target vault folder. Existing scripts using this form keep working exactly as before.
+
+To also embed and index the content into Qdrant — using the same `VectorStore` and chunking as the vault sync — add `--index`:
+
+```bash
+# Single file, extract + index, no Markdown written anywhere
+python main.py ~/Documents/report.pdf --index
+
+# Single file, extract + index + also write the generated Markdown into a vault folder
+python main.py ~/Documents/report.pdf --out ~/obsidian_vault/imports --index
+
+# Whole folder, recursively, extract + index every supported file
+python main.py ~/knowledge_feed --index
+
+# Custom state file (default: sync_state.json next to main.py)
+python main.py ~/knowledge_feed --index --state /path/to/custom_state.json
+```
+
+With `--index`:
+
+1. Walks the input (single file, or every file under a directory recursively via `utils.fs.iter_files`).
+2. Detects type (`ingest/detect.py`) and extracts text (`ingest/extract.py`); unsupported file types are reported and skipped, not fatal.
+3. Skips any file whose sha256 matches the value recorded for it in `sync_state.json`'s `local` namespace from a previous run (independent from the vault sync's `vault` namespace — the two never collide, even sharing one state file).
+4. For new/changed files: builds Markdown (`ingest/markdown.py`), then calls `VectorStore.index_document` (deletes any of that file's existing chunks, then upserts fresh ones) with `source_file` (absolute path) and `markdown_path` attached to every chunk's payload — so `semantic_search` results can always be traced back to both the original file and the generated note.
+5. If `--out` is given, also writes the generated Markdown there (same `safe_write` helper `main.py` already used).
+6. One bad file (extraction error, embedding/Qdrant error) is reported in the summary and skipped; its state is not updated (so it's retried next run), and it never aborts the rest of the batch.
+7. Prints a summary and exits non-zero if any file errored, so a script/cron job can detect a partial failure.
+
+`ingest.sync.index_local_folder` (the pre-`--index` helper) still exists as a thin backward-compatible wrapper around the new `index_local_path`, for any code still calling it directly.
 
 ## Semantic search — CLI
 
@@ -199,7 +230,7 @@ Verify with `hermes mcp test knowledge_cortex`, then `/reload-mcp` in an active 
 python -m unittest discover -s tests -v
 ```
 
-25 tests cover chunking (splitting/reconstruction/ID stability), the vector store (upsert/search/reindex/dimension-mismatch/idempotency, against an in-memory Qdrant instance and a fake Ollama client — no live services required), the Obsidian vault walker (nested directories, exclusion filtering, no infinite loops), and the sync orchestrator (first run, unchanged-skip, changed-reindex, error isolation).
+51 tests cover chunking (splitting/reconstruction/ID stability/metadata merging), the vector store (upsert/search/reindex/dimension-mismatch/idempotency/metadata payloads, against an in-memory Qdrant instance and a fake Ollama client — no live services required), the Obsidian vault walker (nested directories, exclusion filtering, no infinite loops), the vault sync orchestrator (first run, unchanged-skip, changed-reindex, error isolation), local-file ingestion (single file, recursive directory, unchanged/changed/no-orphans, unsupported files, one-bad-file-does-not-abort-batch, source metadata), namespaced sync-state persistence (vault/local isolation, legacy-format migration), and the `main.py` CLI (default extract-only path unchanged, `--index` path indexing + optional Markdown write + incremental state + nonzero exit on errors).
 
 ## Roadmap
 
@@ -213,6 +244,7 @@ python -m unittest discover -s tests -v
 - [x] Ollama + qwen3-embedding:4b embedding integration
 - [x] Chunk long documents before embedding
 - [x] Wire vector indexing directly into vault sync (`sync_cli.py`, `ingest/sync.py`)
+- [x] Wire local-file ingestion (PDF/DOCX/TXT/Markdown) directly into the CLI/Qdrant pipeline (`main.py --index`)
 - [ ] Add metadata filters for source, project, tags, and dates
 
 ### Phase 3: Intelligence

@@ -78,6 +78,7 @@ class VectorStore:
         if not all(len(e) == vector_size for e in embeddings):
             raise RuntimeError("Ollama returned embeddings of inconsistent dimension")
         self.ensure_collection(vector_size)
+        reserved_payload_keys = {"path", "text", "chunk_index", "sha256", "source"}
         points = [
             models.PointStruct(
                 id=chunk["id"],
@@ -89,6 +90,7 @@ class VectorStore:
                     "sha256": chunk["sha256"],
                     "source": chunk["source"],
                     "embedding_model": self.embedding_model,
+                    **{k: v for k, v in chunk.items() if k not in reserved_payload_keys and k != "id"},
                 },
             )
             for chunk, embedding in zip(chunks, embeddings)
@@ -108,16 +110,19 @@ class VectorStore:
             for r in results
         ]
 
-    def index_document(self, path, text, source="obsidian", max_chars=1200):
+    def index_document(self, path, text, source="obsidian", max_chars=1200, metadata=None):
         """Reindex one document: replace ALL of its existing chunks with a
         fresh set derived from the current text. This is the safe entry
         point for ingest pipelines — content-hash-derived chunk IDs mean a
         bare upsert_chunks() call can leave orphaned chunks behind when a
         document shrinks or is heavily rewritten; deleting by path first
         guarantees the stored chunks always match the current content.
+
+        metadata: optional extra payload fields (e.g. source_file,
+        markdown_path) merged into every chunk — see build_chunks.
         """
         from ingest.chunk import build_chunks
-        chunks = build_chunks(path, text, source=source, max_chars=max_chars)
+        chunks = build_chunks(path, text, source=source, max_chars=max_chars, metadata=metadata)
         self.delete_by_path(path)
         if chunks:
             self.upsert_chunks(chunks)

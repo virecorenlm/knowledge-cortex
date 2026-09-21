@@ -106,6 +106,20 @@ class UpsertAndSearchTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             store.embed(["a", "b"])
 
+    def test_index_document_metadata_is_stored_and_searchable(self):
+        store = make_store()
+        store.index_document("vault/note.md", "content from a converted pdf", max_chars=1000,
+                              metadata={"source_file": "/home/vire/docs/report.pdf", "markdown_path": "vault/note.md"})
+        results = store.search("content from a converted pdf", limit=1)
+        self.assertEqual(results[0]["source_file"], "/home/vire/docs/report.pdf")
+        self.assertEqual(results[0]["markdown_path"], "vault/note.md")
+
+    def test_index_document_without_metadata_has_no_extra_fields(self):
+        store = make_store()
+        store.index_document("plain.md", "plain content", max_chars=1000)
+        results = store.search("plain content", limit=1)
+        self.assertNotIn("source_file", results[0])
+
 
 if __name__ == "__main__":
     unittest.main()

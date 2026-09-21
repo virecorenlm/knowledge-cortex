@@ -56,6 +56,22 @@ class BuildChunksTests(unittest.TestCase):
         self.assertEqual(chunks[0]["source"], "obsidian")
         self.assertEqual(len(chunks[0]["sha256"]), 64)
 
+    def test_extra_metadata_is_merged_into_every_chunk(self):
+        chunks = build_chunks("note.md", "a" * 30, max_chars=10,
+                               metadata={"source_file": "/abs/note.pdf", "markdown_path": "vault/note.md"})
+        self.assertEqual(len(chunks), 3)
+        for c in chunks:
+            self.assertEqual(c["source_file"], "/abs/note.pdf")
+            self.assertEqual(c["markdown_path"], "vault/note.md")
+
+    def test_metadata_cannot_override_reserved_fields(self):
+        with self.assertRaises(ValueError):
+            build_chunks("note.md", "hello", max_chars=1000, metadata={"path": "hijacked"})
+
+    def test_no_metadata_behaves_exactly_as_before(self):
+        chunks = build_chunks("note.md", "hello", max_chars=1000)
+        self.assertEqual(set(chunks[0]), {"id", "text", "path", "sha256", "chunk_index", "source"})
+
 
 if __name__ == "__main__":
     unittest.main()
