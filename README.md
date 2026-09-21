@@ -2,45 +2,40 @@
 
 **A shared neural map between human and AI — built on Obsidian, Ollama, Qdrant, and MCP.**
 
-Knowledge-cortex ingests raw knowledge (PDFs, DOCX files, Markdown, and text), turns it into an Obsidian-compatible knowledge graph, generates embeddings through Ollama using `qwen3-embedding:4b`, and stores those vectors in Qdrant for semantic retrieval and automatic linking.
+Knowledge-cortex ingests raw knowledge (PDFs, DOCX files, Markdown, and text), turns it into an Obsidian-compatible knowledge graph, generates embeddings through Ollama using `qwen3-embedding:4b`, and stores those vectors in Qdrant for semantic retrieval and automatic linking. It also runs as its own MCP server, so an AI agent can search the vector index directly instead of re-reading the vault on every question.
 
 ## Architecture
 
 ```text
-Raw inputs
+Obsidian vault (MCP)
    |
    v
-Extract + normalize
-   |
-   +--> Obsidian vault / Markdown graph
-   |
-   +--> Ollama
-          |
-          +--> qwen3-embedding:4b
-                    |
-                    v
-                 Qdrant
-                    |
-                    v
-Semantic search / related-note linking / AI retrieval
+Chunk (ingest/chunk.py) — deterministic, content-hash-derived IDs
    |
    v
-MCP + Vire
+Ollama (qwen3-embedding:4b)
+   |
+   v
+Qdrant (cosine similarity vector store)
+   |
+   v
+Semantic search — via CLI, or via the knowledge-cortex MCP server tools
 ```
+
+Local files (PDF/DOCX/TXT) can also be extracted, converted to Markdown, and indexed the same way — see `ingest/sync.py:index_local_folder`.
 
 Qdrant is the persistent vector-store layer. Ollama provides the embedding model. ChromaDB and the old in-process FAISS index are not used.
 
 ## Current Features
 
-- Recursive folder scanning
-- TXT, PDF, DOCX, and Markdown extraction
-- Obsidian-compatible Markdown generation
-- Ollama-backed embeddings with `qwen3-embedding:4b`
-- Qdrant-backed vector storage
-- Cosine-similarity related-note lookup
-- Deterministic Qdrant point IDs so re-indexing updates existing notes instead of creating duplicates
-- Embedding-model metadata stored with each Qdrant point
-- Vector-size validation to prevent accidentally mixing incompatible embedding models in one collection
+- Recursive Obsidian vault walking over MCP (`ingest/obsidian_client.py`)
+- Local-file ingestion: TXT, PDF, DOCX, and Markdown extraction (`ingest/extract.py`)
+- Deterministic, content-hash-derived chunk IDs (`ingest/chunk.py`) — re-indexing unchanged content is a no-op; changed content replaces old chunks instead of leaving orphans
+- Ollama-backed embeddings with `qwen3-embedding:4b` (2560 dimensions, 40,960-token context) — swap via `EMBEDDING_MODEL`
+- Qdrant-backed vector storage with vector-size validation, so an accidental embedding-model mismatch fails loudly instead of corrupting a collection
+- Incremental vault sync: unchanged notes (by sha256) are skipped on repeat runs, tracked in `sync_state.json`
+- An MCP server (`mcp_server.py`) exposing `semantic_search`, `sync_vault`, and `index_status` as tools, so any MCP client (including Hermes) can query the index directly
+- 25 unit tests covering chunking, storage, Obsidian walking, and sync — `python -m unittest discover -s tests`
 
 ## Requirements
 
@@ -48,7 +43,8 @@ Qdrant is the persistent vector-store layer. Ollama provides the embedding model
 - Ollama
 - `qwen3-embedding:4b` available in Ollama
 - A running Qdrant instance
-- Python dependencies from `requirements.txt`
+- Python dependencies from `requirements.txt` (includes `mcp` for the MCP server)
+- An Obsidian MCP server reachable over HTTP (see `OBSIDIAN_MCP_URL`/`OBSIDIAN_MCP_AUTHORIZATION` below)
 
 Pull the embedding model if it is not already installed:
 
@@ -67,6 +63,7 @@ Default services:
 ```text
 Ollama: http://localhost:11434
 Qdrant: http://localhost:6333
+Obsidian MCP: http://127.0.0.1:27124/mcp/
 ```
 
 Override them with environment variables when needed:
@@ -79,6 +76,10 @@ export QDRANT_COLLECTION=knowledge_cortex
 
 # Only needed when Qdrant requires authentication:
 export QDRANT_API_KEY=your_api_key
+
+# Obsidian MCP connection (streamable HTTP transport)
+export OBSIDIAN_MCP_URL=http://127.0.0.1:27124/mcp/
+export OBSIDIAN_MCP_AUTHORIZATION="Bearer ..."   # omit if the server has auth disabled
 ```
 
 ## Installation
@@ -108,58 +109,97 @@ docker run -d \
 
 If Qdrant already runs elsewhere in the homelab, point `QDRANT_URL` at that service instead of starting another instance.
 
-## Basic Ingestion
+## Syncing the Obsidian vault into the vector index
+
+```bash
+python sync_cli.py                      # sync entire vault, incremental
+python sync_cli.py --root Vire_Realm     # sync one subtree only
+python sync_cli.py --full                # ignore saved state, reindex everything
+```
+
+Each run:
+
+1. Walks the vault over MCP (`vault_list`/`vault_read`), skipping `cache/`, `venv/`, `incoming_memory_dump`, `memory_logs/`, and `.git/` by default.
+2. Chunks each note's full text into ≤1200-character pieces (no overlap, no dropped content), with IDs derived from `(path, sha256, chunk_index)`.
+3. Skips any note whose sha256 matches the value recorded in `sync_state.json` from a previous run.
+4. For every new or changed note, deletes its old chunks (if any) and upserts the new ones — so a shrunk or rewritten note never leaves stale chunks behind.
+5. Writes an updated `sync_state.json` and prints a JSON summary (`indexed_count`, `skipped_unchanged_count`, `errors`).
+
+## Local-file ingestion (PDF/DOCX/TXT → Obsidian markdown)
 
 ```bash
 python main.py <input_folder> --out <obsidian_vault>
 ```
 
-Example:
+This crawls the input folder, extracts content, and writes structured Markdown into the target vault folder. To also index the extracted content directly into Qdrant without a separate vault round-trip, use `ingest.sync.index_local_folder` from Python — see its docstring.
 
-```bash
-python main.py ~/knowledge_feed --out ~/obsidian_vault
+## Semantic search — CLI
+
+```python
+from graph.store import VectorStore
+
+store = VectorStore()  # reads OLLAMA_URL / EMBEDDING_MODEL / QDRANT_URL / QDRANT_COLLECTION from env
+results = store.search(
+    "What is the Siri shortcut for Coffee Drop?",
+    limit=5,
+    instruct="Given a web search query, retrieve relevant passages that answer the query",
+)
+for r in results:
+    print(r["score"], r["path"], r["text"][:100])
 ```
 
-The current CLI crawls the input folder, extracts content, and writes structured Markdown into the Obsidian vault. Direct Qdrant indexing from `main.py` is a roadmap item.
-
-## Qdrant Semantic Linking
-
-`graph/autolink.py` uses Ollama + Qdrant.
-
-The linking flow is:
-
-1. Read Markdown notes.
-2. Send the note text to Ollama's embedding API.
-3. Generate embeddings with `qwen3-embedding:4b`.
-4. Create the `knowledge_cortex` Qdrant collection using the vector size returned by the model if the collection does not exist.
-5. Upsert note vectors and payloads into Qdrant.
-6. Query Qdrant using cosine similarity.
-7. Return the five closest related notes for each note, excluding itself.
-
-The stored payload currently includes:
-
-```json
-{
-  "path": "/path/to/note.md",
-  "text": "note contents",
-  "embedding_model": "qwen3-embedding:4b"
-}
-```
+The `instruct` argument matches Qwen3-Embedding's documented query-instruction format; document text is embedded plain (no prefix), matching how the ingestion path calls `store.index_document`.
 
 ### Changing embedding models
 
-Do not mix vectors from different embedding models in the same collection. If the embedding model changes later, use a new `QDRANT_COLLECTION` name or recreate and re-index the existing collection.
-
-Knowledge Cortex checks the collection's vector size before indexing and stops with an error if the dimensions are incompatible.
+Do not mix vectors from different embedding models in the same collection. If the embedding model changes later, use a new `QDRANT_COLLECTION` name — `VectorStore.ensure_collection` checks the collection's vector size before indexing and raises a clear error on a mismatch instead of silently corrupting the collection.
 
 ## MCP Integration
 
-The Obsidian/MCP layer remains the human/AI knowledge interface. Qdrant complements it with semantic retrieval, while Ollama provides local embedding generation.
+Knowledge-cortex both **consumes** an Obsidian MCP server (to read/write vault notes) and **exposes its own MCP server** (so agents can search/sync without re-implementing any of this).
 
-- **Obsidian** — readable Markdown, links, tags, and graph navigation.
-- **Ollama / qwen3-embedding:4b** — local embedding generation.
-- **Qdrant** — persistent vector similarity, semantic recall, and machine retrieval.
-- **MCP** — controlled access for AI tools and agents.
+### Consuming: Obsidian MCP
+
+`ingest/obsidian_client.py` is a small async wrapper around the standard `vault_list`/`vault_read`/`vault_write`/`vault_append` MCP tools, using the streamable-HTTP transport. Point it at the same Obsidian MCP endpoint your other tools use via `OBSIDIAN_MCP_URL`/`OBSIDIAN_MCP_AUTHORIZATION`.
+
+### Exposing: the Knowledge Cortex MCP server
+
+```bash
+python mcp_server.py            # stdio transport
+python mcp_server.py --http --port 8770   # streamable HTTP transport
+```
+
+Tools exposed:
+
+| Tool | Purpose |
+|---|---|
+| `semantic_search(query, limit=5)` | Search the vector index; returns ranked chunks with path, text, and score as JSON |
+| `sync_vault(root="", full=false)` | Index/re-index vault notes into Qdrant; incremental unless `full=true` |
+| `index_status()` | Report collection name, point count, and embedding model in use |
+
+To register it with Hermes as a stdio MCP server, add to `~/.hermes/config.yaml` under `mcp_servers` (via `hermes config set`, never hand-edited):
+
+```yaml
+mcp_servers:
+  knowledge_cortex:
+    command: "/home/vire/GITHUB/knowledge-cortex/.venv/bin/python"
+    args: ["/home/vire/GITHUB/knowledge-cortex/mcp_server.py"]
+    env:
+      OBSIDIAN_MCP_URL: "http://127.0.0.1:27124/mcp/"
+      OBSIDIAN_MCP_AUTHORIZATION: "${OBSIDIAN_MUSKI_AUTHORIZATION}"
+      QDRANT_COLLECTION: "knowledge_cortex"
+      EMBEDDING_MODEL: "qwen3-embedding:4b"
+```
+
+Verify with `hermes mcp test knowledge_cortex`, then `/reload-mcp` in an active session (or start a new one) to pick up the tools.
+
+## Testing
+
+```bash
+python -m unittest discover -s tests -v
+```
+
+25 tests cover chunking (splitting/reconstruction/ID stability), the vector store (upsert/search/reindex/dimension-mismatch/idempotency, against an in-memory Qdrant instance and a fake Ollama client — no live services required), the Obsidian vault walker (nested directories, exclusion filtering, no infinite loops), and the sync orchestrator (first run, unchanged-skip, changed-reindex, error isolation).
 
 ## Roadmap
 
@@ -171,16 +211,15 @@ The Obsidian/MCP layer remains the human/AI knowledge interface. Qdrant compleme
 ### Phase 2: Vector Memory
 - [x] Qdrant vector-store integration
 - [x] Ollama + qwen3-embedding:4b embedding integration
-- [x] Semantic related-note lookup
-- [ ] Wire vector indexing directly into the ingestion CLI
-- [ ] Chunk long documents before embedding
+- [x] Chunk long documents before embedding
+- [x] Wire vector indexing directly into vault sync (`sync_cli.py`, `ingest/sync.py`)
 - [ ] Add metadata filters for source, project, tags, and dates
 
 ### Phase 3: Intelligence
-- [ ] Obsidian MCP server integration
-- [ ] AI-powered structuring (frontmatter, tags, metadata)
-- [ ] Bidirectional sync
-- [ ] Semantic search CLI/API
+- [x] Obsidian MCP server integration (consume, via `ingest/obsidian_client.py`)
+- [x] Semantic search MCP server (expose, via `mcp_server.py`)
+- [ ] AI-powered structuring (frontmatter, tags, metadata) — `ingest/ai_struct.py` exists but is not wired into the sync path yet
+- [ ] Bidirectional sync (write AI-generated notes back into the vault via `write_note`/`append_note`)
 - [ ] Hybrid retrieval combining vectors and metadata
 
 ### Phase 4: Cognitive Infrastructure
@@ -192,7 +231,7 @@ The Obsidian/MCP layer remains the human/AI knowledge interface. Qdrant compleme
 
 ## Philosophy
 
-Knowledge-cortex is cognitive infrastructure: persistent Markdown for human-readable memory, Ollama for local embedding generation, Qdrant for semantic machine memory, and MCP for controlled AI access.
+Knowledge-cortex is cognitive infrastructure: persistent Markdown for human-readable memory, Ollama for local embedding generation, Qdrant for semantic machine memory, and MCP for controlled AI access in both directions.
 
 The goal is continuity: knowledge should persist, accumulate, connect, and remain usable across sessions and machines.
 
