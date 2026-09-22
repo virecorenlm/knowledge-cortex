@@ -5,7 +5,8 @@ from tempfile import TemporaryDirectory
 from qdrant_client import QdrantClient
 
 from graph.store import VectorStore
-from main import extract_to_markdown, index_to_qdrant, analyze_vault
+from main import extract_to_markdown, index_to_qdrant, analyze_vault, propose_vault_changes, \
+    _decision_cli, list_proposals_cli, show_proposal_cli
 
 
 class FakeOllama:
@@ -189,6 +190,25 @@ class MainCliWriteVaultTests(unittest.TestCase):
         )
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("--write-vault requires --index", result.stderr)
+
+    def test_project_requires_index_flag_at_parser_level(self):
+        import subprocess
+        import sys
+        f = self.write("input/doc.txt", "content")
+        result = subprocess.run(
+            [sys.executable, "main.py", str(f), "--project", "P"],
+            cwd=str(Path(__file__).resolve().parent.parent),
+            capture_output=True, text=True,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("--project requires --index", result.stderr)
+
+    def test_project_is_stored_as_filter_metadata(self):
+        f = self.write("input/doc.txt", "content")
+        store = make_store()
+        index_to_qdrant(str(f), None, self.root / "state.json", store=store, project="Home")
+        self.assertEqual(len(store.search("x", filters={"project": "Home"})), 1)
+        self.assertEqual(store.search("x", filters={"project": "Other"}), [])
 
     def test_write_vault_is_opt_in_indexing_without_it_never_touches_obsidian(self):
         from tests.test_vault_writer import FakeObsidian
@@ -437,6 +457,126 @@ class MainCliAnalyzeVaultTests(unittest.TestCase):
         index_to_qdrant(str(self.root / "input"), None, self.state_path, store=store)
         code = analyze_vault(self.state_path, obsidian=ob)
         self.assertEqual(code, 0)
+
+
+class MainCliProposalsTests(unittest.TestCase):
+    """--propose-vault-changes / --approve-proposal / --reject-proposal /
+    --list-proposals / --show-proposal: durable proposals, no writes to
+    source/Obsidian/Qdrant/sync_state.json beyond the proposal files themselves."""
+
+    def setUp(self):
+        self._tmp = TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.root = Path(self._tmp.name)
+        self.state_path = self.root / "sync_state.json"
+        self.proposals_dir = self.root / "proposals"
+
+    def write(self, name, content):
+        p = self.root / name
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(content, encoding="utf-8")
+        return p
+
+    def _seed_human_modified_note(self):
+        from tests.test_vault_writer import FakeObsidian
+        from ingest.vault_writer import _parse_frontmatter
+        f = self.write("input/doc.txt", "content for proposal CLI test")
+        store = make_store()
+        ob = FakeObsidian()
+        index_to_qdrant(str(self.root / "input"), None, self.state_path, store=store,
+                         write_vault=True, obsidian=ob)
+        dest_path = next(iter(ob.files))
+        content = ob.files[dest_path]
+        _, body = _parse_frontmatter(content)
+        ob.files[dest_path] = content.replace(body.strip(), "a human edit for the proposal test")
+        return ob
+
+    def test_propose_vault_changes_creates_a_proposal_for_human_modified(self):
+        import io, json
+        from contextlib import redirect_stdout
+        ob = self._seed_human_modified_note()
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            code = propose_vault_changes(self.state_path, proposals_dir=self.proposals_dir,
+                                          json_output=True, obsidian=ob)
+        self.assertEqual(code, 0)
+        parsed = json.loads(buf.getvalue())
+        self.assertEqual(len(parsed), 1)
+        self.assertEqual(parsed[0]["classification"], "HUMAN_MODIFIED")
+        self.assertTrue(parsed[0]["created"])
+
+    def test_full_lifecycle_propose_show_approve(self):
+        import io, json
+        from contextlib import redirect_stdout
+        ob = self._seed_human_modified_note()
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            propose_vault_changes(self.state_path, proposals_dir=self.proposals_dir,
+                                   json_output=True, obsidian=ob)
+        proposal_id = json.loads(buf.getvalue())[0]["proposal_id"]
+
+        # Show
+        buf2 = io.StringIO()
+        with redirect_stdout(buf2):
+            code = show_proposal_cli(proposal_id, proposals_dir=self.proposals_dir, json_output=True)
+        self.assertEqual(code, 0)
+        shown = json.loads(buf2.getvalue())
+        self.assertEqual(shown["status"], "pending")
+
+        # Approve (fingerprints unchanged since proposal creation)
+        code = _decision_cli(self.proposals_dir, proposal_id, "approve", None, obsidian=ob, state_path=self.state_path)
+        self.assertEqual(code, 0)
+
+        buf3 = io.StringIO()
+        with redirect_stdout(buf3):
+            show_proposal_cli(proposal_id, proposals_dir=self.proposals_dir, json_output=True)
+        self.assertEqual(json.loads(buf3.getvalue())["status"], "approved")
+
+    def test_reject_proposal_cli(self):
+        import io, json
+        from contextlib import redirect_stdout
+        ob = self._seed_human_modified_note()
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            propose_vault_changes(self.state_path, proposals_dir=self.proposals_dir,
+                                   json_output=True, obsidian=ob)
+        proposal_id = json.loads(buf.getvalue())[0]["proposal_id"]
+        code = _decision_cli(self.proposals_dir, proposal_id, "reject", "not needed", obsidian=ob)
+        self.assertEqual(code, 0)
+        buf2 = io.StringIO()
+        with redirect_stdout(buf2):
+            show_proposal_cli(proposal_id, proposals_dir=self.proposals_dir, json_output=True)
+        shown = json.loads(buf2.getvalue())
+        self.assertEqual(shown["status"], "rejected")
+        self.assertEqual(shown["decision"]["note"], "not needed")
+
+    def test_list_proposals_cli(self):
+        import io
+        from contextlib import redirect_stdout
+        ob = self._seed_human_modified_note()
+        propose_vault_changes(self.state_path, proposals_dir=self.proposals_dir, obsidian=ob)
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            code = list_proposals_cli(proposals_dir=self.proposals_dir)
+        self.assertEqual(code, 0)
+        self.assertIn("PENDING", buf.getvalue())
+
+    def test_approval_causes_zero_qdrant_or_state_writes(self):
+        import io, json
+        from contextlib import redirect_stdout
+        ob = self._seed_human_modified_note()
+        state_before = self.state_path.read_bytes()
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            propose_vault_changes(self.state_path, proposals_dir=self.proposals_dir,
+                                   json_output=True, obsidian=ob)
+        proposal_id = json.loads(buf.getvalue())[0]["proposal_id"]
+        state_after_propose = self.state_path.read_bytes()
+        self.assertEqual(state_before, state_after_propose)  # propose never writes state
+
+        _decision_cli(self.proposals_dir, proposal_id, "approve", None, obsidian=ob, state_path=self.state_path)
+        state_after_approve = self.state_path.read_bytes()
+        self.assertEqual(state_before, state_after_approve)  # approve never writes state either
 
 
 if __name__ == "__main__":

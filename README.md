@@ -287,6 +287,36 @@ Precedence rationale: provenance problems are checked before any content compari
 
 **Zero writes, guaranteed by construction:** `analyze_managed_notes` only ever calls `obsidian.list_dir` and `obsidian.read_note` — `write_note`/`append_note` are never imported or called anywhere in `ingest/reverse_analyzer.py`. It never imports `VectorStore` (no Qdrant access at all), never calls `sync_cli.save_state`, and never writes to a source file (source re-extraction happens purely in memory, for hashing).
 
+## Durable change proposals + explicit approval (`--propose-vault-changes`)
+
+The analyzer above only prints findings; nothing persists between runs. `--propose-vault-changes` turns each actionable finding into a durable, reviewable **proposal file** that a human can inspect and explicitly approve or reject — still with **zero writes to source files, Obsidian, Qdrant, or `sync_state.json`**, even when a proposal is approved. This is preparation for a future, still-unbuilt "apply" layer; nothing in this phase applies anything.
+
+```bash
+python main.py --propose-vault-changes                   # analyze + create proposals for actionable divergence
+python main.py --propose-vault-changes --json             # machine-readable
+python main.py --list-proposals                            # list all proposals with status
+python main.py --show-proposal <id>                         # full detail: fingerprints, diff, decision
+python main.py --approve-proposal <id> --decision-note "..."  # approve (re-verifies staleness first)
+python main.py --reject-proposal <id> --decision-note "..."   # reject (works even if inputs have drifted)
+python main.py --propose-vault-changes --proposals-dir /custom/path  # override storage location
+```
+
+**Storage.** One JSON file per proposal under `state/proposals/<proposal_id>.json` (override with `--proposals-dir`), written atomically (temp file + `os.replace`) so a crash mid-write never leaves a corrupt file. Inspectable with any JSON tool, not just this CLI.
+
+**Which classifications generate a proposal:** everything except `IN_SYNC` (nothing to review) and `ANALYSIS_INSUFFICIENT_STATE`/`ERROR` (not enough information to propose anything without guessing). So `HUMAN_MODIFIED`, `SOURCE_CHANGED`, `MISSING`, `UNMANAGED_AT_TARGET`, and `INVALID_MANAGED_NOTE` all produce a proposal.
+
+**Proposal-ID identity contract.** The id is `sha256(canonical_json({source_path, managed_note_path, classification, proposed_action, source_sha256, expected_generated_sha256, live_vault_sha256}))[:16]` — deliberately excluding `created_at`, `status`, `decision`, and the diff text (a rendering of the same fingerprinted facts, not an independent one). This means: regenerating a proposal for an **unchanged** situation reproduces the exact same id (idempotent — `--propose-vault-changes` won't pile up duplicates for a persistent, unresolved divergence), while the id **changes** the moment any material fingerprint changes, which is also what makes staleness detection possible (see below).
+
+**What's stored, and why the exact reviewed content is kept, not just a hash:** each proposal captures the classification, proposed action, fingerprints (`source_sha256`, `expected_generated_sha256`, `live_vault_sha256`), the diff (with truncation info), and the **exact live vault body text reviewed** (`reviewed_live_vault_body`) — not merely its hash. A future apply layer must be able to act on precisely what a human approved, not something regenerated later that might legitimately differ (e.g. if `sync_state.json`'s cached body is later overwritten by a subsequent `--write-vault` run, or the analyzer's own logic changes) — so the full text is captured now, while safety matters more than saving a few KB.
+
+**Approval semantics — staleness is checked EVERY time, non-negotiably.** `--approve-proposal` re-reads the live source and vault note immediately before approving and re-computes their current fingerprints. If the source no longer exists, its hash has changed, the managed note no longer exists, or its live body hash has changed since the proposal was created, the proposal is marked `stale` and **NOT approved** — the human is told exactly which fingerprint drifted. A stale proposal is never retroactively approvable, even if the drifted condition is later reverted back to match; a fresh proposal (with a freshly-computed, correct id) must be generated instead. Approval only ever writes to the proposal's own JSON file (`status` + `decision` fields) — never source, Obsidian, Qdrant, or `sync_state.json`.
+
+**Rejection has no staleness requirement** — a human may reject an outdated proposal freely; there's nothing unsafe about recording "no, don't do this" regardless of what's changed since.
+
+**Terminal decisions.** `approved` and `rejected` are immutable once set — attempting to approve an already-rejected proposal (or vice versa) is refused with a clear error, never silently overwritten. A changed situation is expected to produce a **new** proposal with a new id via another `--propose-vault-changes` run, not a mutated old one.
+
+**No apply layer exists yet.** Approving a proposal changes only its own record; nothing currently reads an `approved` proposal and does anything with it. That is explicitly out of scope for this phase.
+
 ## Semantic search — CLI
 
 ```python
@@ -303,6 +333,36 @@ for r in results:
 ```
 
 The `instruct` argument matches Qwen3-Embedding's documented query-instruction format; document text is embedded plain (no prefix), matching how the ingestion path calls `store.index_document`.
+
+### Metadata filters (source, project, tags, dates)
+
+Every indexed chunk carries filterable payload fields alongside `path`/`text`, and `search` accepts an optional `filters` dict (all keys optional, combined with AND):
+
+```python
+store.search("sleep quality", filters={
+    "source": "obsidian",                 # or "local_ingest"; a list means any of
+    "project": ["Vire_Realm", "Health"],  # a list means any of
+    "tags": ["health", "sleep"],          # "#" optional, case-insensitive
+    "tag_mode": "all",                    # "all" (default) or "any"
+    "date_from": "2024-01-01",            # inclusive
+    "date_to": "2024-06-30",              # inclusive; a date-only value covers that whole day
+})
+```
+
+How each field is derived at ingest time (`ingest/metadata.py`):
+
+| Field | Vault notes (`sync_cli.py`) | Local files (`main.py --index`) |
+|---|---|---|
+| `source` | `obsidian` | `local_ingest` |
+| `project` | frontmatter `project:`, else the note's top-level vault folder (root-level notes have none) | `--project NAME`, else a `project:` in the document's own frontmatter |
+| `tags` | frontmatter `tags:`/`tag:` plus inline `#tags` (code blocks and inline code are ignored), lowercased; nested tags also produce their parents, so `a/b` matches a filter for `a` | same |
+| `doc_date` | frontmatter `date:` or `created:`, else a `YYYY-MM-DD` filename prefix (daily notes) | frontmatter `date:`/`created:`, else the file's modification time. The `ingested:` timestamp is never used |
+
+`doc_date` is stored as RFC 3339 UTC; naive dates are treated as UTC. A date filter excludes chunks with no known date. Invalid filters (an unknown key, a bad date, or a bad `tag_mode`) raise `ValueError` before anything is embedded. `VectorStore` creates Qdrant payload indexes for `path`, `source`, `project`, `tags` and `doc_date`.
+
+**Backfilling existing indexes.** Content indexed before filter metadata existed has no `project`/`tags`/`doc_date`:
+- **Vault notes** are skipped as unchanged, so run `python sync_cli.py --full` (or MCP `sync_vault(full=true)`) once.
+- **Local files** backfill automatically on the next `--index` run. Their metadata is recomputed from the cached `generated_body` and written onto the existing points with `set_payload`. This skips re-extraction, AI structuring and re-embedding, and is reported as `Filter metadata updated (no re-embedding)`. The same path applies when a later run passes a different `--project`.
 
 ### Changing embedding models
 
@@ -327,7 +387,7 @@ Tools exposed:
 
 | Tool | Purpose |
 |---|---|
-| `semantic_search(query, limit=5)` | Search the vector index; returns ranked chunks with path, text, and score as JSON |
+| `semantic_search(query, limit=5, source=None, project=None, tags=None, tag_mode="all", date_from="", date_to="")` | Search the vector index, optionally filtered by metadata (see above); returns ranked chunks with path, text, score, and metadata as JSON (or `{"error": ...}` for invalid filters) |
 | `sync_vault(root="", full=false)` | Index/re-index vault notes into Qdrant; incremental unless `full=true` |
 | `index_status()` | Report collection name, point count, and embedding model in use |
 
@@ -353,7 +413,7 @@ Verify with `hermes mcp test knowledge_cortex`, then `/reload-mcp` in an active 
 python -m unittest discover -s tests -v
 ```
 
-152 tests cover chunking (splitting/reconstruction/ID stability/metadata merging), the vector store (upsert/search/reindex/dimension-mismatch/idempotency/metadata payloads, against an in-memory Qdrant instance and a fake Ollama client — no live services required), the Obsidian vault walker (nested directories, exclusion filtering, no infinite loops), the vault sync orchestrator (first run, unchanged-skip, changed-reindex, error isolation), local-file ingestion (single file, recursive directory, unchanged/changed/no-orphans, unsupported files, one-bad-file-does-not-abort-batch, source metadata), namespaced sync-state persistence (vault/local isolation, legacy-format migration), AI structuring (invocation, structured text reaching the store, provenance metadata, safe fallback on request failure, safe fallback on empty/invalid output, incremental skip/reprocess on source-change/flag-toggle/model-change, directory ingestion with structuring enabled, configurable timeout precedence, failed-attempt retry semantics, ai_structured metadata correctness), managed vault write-back (create/conflict/safe-update/human-edit-detection/skip-on-unchanged/frontmatter-provenance/hash-excludes-frontmatter, all against an in-memory fake Obsidian client), the read-only reverse-sync analyzer (all 8 classifications, diff generation and truncation, precedence, zero-writes-to-vault/source/state, multiple-notes-in-one-run, one-invalid-note-does-not-block-others, legacy-state safe classification), and the `main.py` CLI (default extract-only path unchanged, `--index` path indexing + optional Markdown write + incremental state + nonzero exit on errors, `--ai-structure` parser validation and plumbing, existing-vault-note protection, source file never modified, `--write-vault` opt-in/conflict-reporting/custom-destination, `--analyze-vault` zero-writes/JSON-output/source-filter).
+241 tests cover metadata filters (frontmatter/tag/date extraction, filtered search by source/project/tags/date ranges, local-file payload backfill without re-embedding, MCP filter pass-through), chunking (splitting/reconstruction/ID stability/metadata merging), the vector store (upsert/search/reindex/dimension-mismatch/idempotency/metadata payloads, against an in-memory Qdrant instance and a fake Ollama client — no live services required), the Obsidian vault walker (nested directories, exclusion filtering, no infinite loops), the vault sync orchestrator (first run, unchanged-skip, changed-reindex, error isolation), local-file ingestion (single file, recursive directory, unchanged/changed/no-orphans, unsupported files, one-bad-file-does-not-abort-batch, source metadata), namespaced sync-state persistence (vault/local isolation, legacy-format migration), AI structuring (invocation, structured text reaching the store, provenance metadata, safe fallback on request failure, safe fallback on empty/invalid output, incremental skip/reprocess on source-change/flag-toggle/model-change, directory ingestion with structuring enabled, configurable timeout precedence, failed-attempt retry semantics, ai_structured metadata correctness), managed vault write-back (create/conflict/safe-update/human-edit-detection/skip-on-unchanged/frontmatter-provenance/hash-excludes-frontmatter, all against an in-memory fake Obsidian client), the read-only reverse-sync analyzer (all 8 classifications, diff generation and truncation, precedence, zero-writes-to-vault/source/state, multiple-notes-in-one-run, one-invalid-note-does-not-block-others, legacy-state safe classification), durable change proposals (deterministic ID derivation and drift-sensitivity, idempotent regeneration, atomic writes, round-tripping, malformed/unsupported-schema-version safe failure, staleness detection on source/vault/note drift, terminal-decision immutability in both directions, zero writes to source/vault/Qdrant/sync_state on approval or rejection), and the `main.py` CLI (default extract-only path unchanged, `--index` path indexing + optional Markdown write + incremental state + nonzero exit on errors, `--ai-structure` parser validation and plumbing, existing-vault-note protection, source file never modified, `--write-vault` opt-in/conflict-reporting/custom-destination, `--analyze-vault` zero-writes/JSON-output/source-filter, full propose/approve/reject/list/show lifecycle).
 
 ## Roadmap
 
@@ -368,7 +428,7 @@ python -m unittest discover -s tests -v
 - [x] Chunk long documents before embedding
 - [x] Wire vector indexing directly into vault sync (`sync_cli.py`, `ingest/sync.py`)
 - [x] Wire local-file ingestion (PDF/DOCX/TXT/Markdown) directly into the CLI/Qdrant pipeline (`main.py --index`)
-- [ ] Add metadata filters for source, project, tags, and dates
+- [x] Add metadata filters for source, project, tags, and dates (`ingest/metadata.py`, `VectorStore.search(filters=...)`, MCP `semantic_search`)
 
 ### Phase 3: Intelligence
 - [x] Obsidian MCP server integration (consume, via `ingest/obsidian_client.py`)
@@ -376,6 +436,8 @@ python -m unittest discover -s tests -v
 - [x] AI-powered structuring (frontmatter, tags, metadata) — `ingest/ai_struct.py`, wired into local ingestion via `main.py --index --ai-structure`; opt-in, fails safe to raw Markdown, configurable timeout (`AI_STRUCTURE_TIMEOUT_SECONDS`, default 300s), and failed attempts are automatically retried on the next run rather than getting stuck on the raw fallback permanently.
 - [x] Managed, conflict-safe one-way write-back into a dedicated vault subtree (`ingest/vault_writer.py`, `main.py --index --write-vault`) — never overwrites a note it can't prove it owns and last wrote unmodified; human edits always win. Still one-directional only.
 - [x] Read-only reverse-sync analyzer (`ingest/reverse_analyzer.py`, `main.py --analyze-vault`) — classifies every managed note (IN_SYNC/HUMAN_MODIFIED/MISSING/UNMANAGED_AT_TARGET/SOURCE_CHANGED/SOURCE_MISSING/INVALID_MANAGED_NOTE/ANALYSIS_INSUFFICIENT_STATE) with a diff and proposed action; makes zero writes anywhere. Preparation for, not implementation of, bidirectional sync.
+- [x] Durable change proposals + explicit human approval (`ingest/proposals.py`, `main.py --propose-vault-changes`/`--approve-proposal`/`--reject-proposal`/`--list-proposals`/`--show-proposal`) — deterministic content-derived proposal IDs, atomic JSON storage under `state/proposals/`, mandatory staleness re-verification before approval, immutable terminal decisions. Still makes zero writes to source/Obsidian/Qdrant/sync_state.json, even on approval. No apply layer yet.
+- [ ] Apply layer: consume an approved proposal and actually perform the reverse write (source-file update or similar) — the only remaining piece before real bidirectional sync
 - [ ] Full bidirectional sync (vault → source-file reverse sync, automatic conflict merge, rename/delete propagation)
 - [ ] Hybrid retrieval combining vectors and metadata
 

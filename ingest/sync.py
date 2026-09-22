@@ -10,6 +10,8 @@
 
 import hashlib
 
+from ingest.metadata import extract_filter_metadata
+
 
 async def sync_vault_to_index(obsidian, store, root="", exclude_substrings=(), state=None, max_chars=1200):
     """Index every markdown note under root into store.
@@ -17,6 +19,12 @@ async def sync_vault_to_index(obsidian, store, root="", exclude_substrings=(), s
     state: optional dict of {path: sha256} from a previous run, used to skip
     unchanged notes. Callers own persistence of this dict; this function only
     reads and updates it in memory and returns it.
+
+    Every chunk carries filter metadata (project/tags/doc_date, see
+    ingest.metadata); a note's project defaults to its top-level vault
+    folder. Notes indexed before filter metadata existed are skipped as
+    unchanged — run once with full state reset (sync_cli.py --full) to
+    backfill them.
     """
     state = {} if state is None else state
     report = {"indexed": [], "skipped_unchanged": [], "errors": []}
@@ -31,14 +39,15 @@ async def sync_vault_to_index(obsidian, store, root="", exclude_substrings=(), s
         if state.get(path) == digest:
             report["skipped_unchanged"].append(path)
             continue
-        chunks = store.index_document(path, text, source="obsidian", max_chars=max_chars)
+        metadata = extract_filter_metadata(text, path=path, folder_as_project=True)
+        chunks = store.index_document(path, text, source="obsidian", max_chars=max_chars, metadata=metadata)
         state[path] = digest
         report["indexed"].append({"path": path, "chunk_count": len(chunks)})
     return report, state
 
 
 def index_local_path(store, path, state=None, max_chars=1200, markdown_prefix="local_ingest",
-                      ai_structure=False, structure_fn=None):
+                      ai_structure=False, structure_fn=None, project=None):
     """Extract + chunk + index one file, or every supported file under a
     directory (recursively). This is the local-file entry point wired into
     main.py: files don't only become Markdown, they also enter the same
@@ -59,6 +68,15 @@ def index_local_path(store, path, state=None, max_chars=1200, markdown_prefix="l
 
     structure_fn: injectable in place of ingest.ai_struct.structure_markdown
     (for tests / alternate providers). Ignored when ai_structure is False.
+
+    project: optional project name stored as filter metadata on every chunk
+    (overrides a "project:" in the document's own frontmatter). Chunks also
+    carry tags and doc_date (frontmatter date, else file mtime) — see
+    ingest.metadata. Filter metadata is recomputed from the cached
+    generated_body even for unchanged files; if it differs from what state
+    recorded (e.g. a new --project, or state predating filter metadata),
+    the existing Qdrant points are updated in place via store.set_metadata,
+    with no re-extraction, re-structuring, or re-embedding.
 
     state: optional dict of {absolute_source_path: entry} from a previous
     run, where entry is either a legacy plain sha256 string (pre-AI-structure
@@ -85,6 +103,7 @@ def index_local_path(store, path, state=None, max_chars=1200, markdown_prefix="l
       skipped_empty:       [source_file, ...]
       skipped_unsupported: [source_file, ...]
       skipped_unchanged:   [source_file, ...]
+      metadata_updated:    [source_file, ...]  (unchanged, payload-only update)
       errors:              [{path, error}]
     One bad file (extraction failure or embedding/indexing failure) is
     reported and skipped; it never aborts the batch or corrupts state for
@@ -105,7 +124,7 @@ def index_local_path(store, path, state=None, max_chars=1200, markdown_prefix="l
     root = Path(path)
     files = iter_files(root) if root.is_dir() else iter([str(root)])
     report = {"indexed": [], "skipped_empty": [], "skipped_unsupported": [],
-              "skipped_unchanged": [], "errors": []}
+              "skipped_unchanged": [], "metadata_updated": [], "errors": []}
 
     for file in files:
         abs_path = str(Path(file).resolve())
@@ -168,9 +187,19 @@ def index_local_path(store, path, state=None, max_chars=1200, markdown_prefix="l
         # considered "unchanged" — it is always retried, so a document
         # can't get permanently stuck raw just because one run happened to
         # time out or fail validation.
+        markdown_path = f"{markdown_prefix}/{Path(file).name}"
         if (prior_digest == source_digest and prior_requested == bool(ai_structure)
                 and (not ai_structure or (prior_succeeded and prior_prompt_version == PROMPT_VERSION))
                 and prior_has_cached_body):
+            filter_metadata = _local_filter_metadata(prior["generated_body"], file, project)
+            if prior.get("filter_metadata") != filter_metadata:
+                try:
+                    store.set_metadata(markdown_path, filter_metadata)
+                except Exception as exc:  # noqa: BLE001 - report and continue; state stays stale so it's retried
+                    report["errors"].append({"path": abs_path, "error": str(exc)})
+                    continue
+                prior["filter_metadata"] = filter_metadata
+                report["metadata_updated"].append(abs_path)
             report["skipped_unchanged"].append(abs_path)
             continue
 
@@ -195,7 +224,6 @@ def index_local_path(store, path, state=None, max_chars=1200, markdown_prefix="l
             else:
                 indexed_text = md
 
-            markdown_path = f"{markdown_prefix}/{Path(file).name}"
             # document_body is the ACTUAL document content, with the
             # ingestion frontmatter (source:/ingested:) stripped off. This
             # is what gets reused for --write-vault: the managed note's
@@ -205,7 +233,9 @@ def index_local_path(store, path, state=None, max_chars=1200, markdown_prefix="l
             # frontmatter -- this only affects what a future write-vault
             # stage receives as the note body.
             _, document_body = split_frontmatter(indexed_text)
+            filter_metadata = _local_filter_metadata(document_body, file, project)
             metadata = {
+                **filter_metadata,
                 "source_file": abs_path,
                 "markdown_path": markdown_path,
                 "ai_structured": bool(ai_structure and structured_ok),
@@ -242,6 +272,7 @@ def index_local_path(store, path, state=None, max_chars=1200, markdown_prefix="l
             # expensive) AI structuring. See the skip-condition comment
             # above for why its absence forces one reprocess.
             "generated_body": document_body,
+            "filter_metadata": filter_metadata,
         }
         report["indexed"].append({
             "source_file": abs_path, "markdown_path": markdown_path,
@@ -252,6 +283,20 @@ def index_local_path(store, path, state=None, max_chars=1200, markdown_prefix="l
             "structure_reason": structure_reason,
         })
     return report, state
+
+
+def _local_filter_metadata(document_body, file, project):
+    """Filter metadata for a local file: computed from the document body
+    (never the ingestion frontmatter, whose "ingested:" timestamp is not the
+    document's date), with the file's mtime as the fallback doc_date."""
+    import os
+    from datetime import datetime, timezone
+    try:
+        mtime = datetime.fromtimestamp(os.path.getmtime(file), tz=timezone.utc)
+    except OSError:
+        mtime = None
+    return extract_filter_metadata(document_body, path=os.path.basename(file), project=project,
+                                   fallback_date=mtime)
 
 
 def index_local_folder(store, root_folder, obsidian_prefix="local_ingest", max_chars=1200):

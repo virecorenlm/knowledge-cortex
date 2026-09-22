@@ -48,3 +48,4 @@ processing/
 
 # Sync state (local, machine-specific)
 sync_state.json
+state/

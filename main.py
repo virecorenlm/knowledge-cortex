@@ -26,7 +26,7 @@ def extract_to_markdown(input_path, out_dir):
 
 
 def index_to_qdrant(input_path, out_dir, state_path, store=None, ai_structure=False, structure_fn=None,
-                     write_vault=False, managed_vault_dir=None, obsidian=None):
+                     write_vault=False, managed_vault_dir=None, obsidian=None, project=None):
     """New behavior (--index): extract + chunk + embed + upsert into the
     same Qdrant collection VectorStore/sync_cli use, via
     ingest.sync.index_local_path — no duplicated extraction, chunking, or
@@ -68,6 +68,9 @@ def index_to_qdrant(input_path, out_dir, state_path, store=None, ai_structure=Fa
     ObsidianClient() reading OBSIDIAN_MCP_URL/OBSIDIAN_MCP_AUTHORIZATION
     from the environment. Only used when write_vault is True.
 
+    project: optional project name stored as filterable metadata on every
+    indexed chunk (see ingest/metadata.py).
+
     store: optional pre-built VectorStore (for tests); defaults to
     VectorStore() reading OLLAMA_URL/EMBEDDING_MODEL/QDRANT_URL/QDRANT_COLLECTION
     from the environment, same as sync_cli.py.
@@ -80,7 +83,7 @@ def index_to_qdrant(input_path, out_dir, state_path, store=None, ai_structure=Fa
     store = store or VectorStore()
     state = load_state(state_path, namespace="local")
     report, state = index_local_path(store, input_path, state=state, ai_structure=ai_structure,
-                                      structure_fn=structure_fn)
+                                      structure_fn=structure_fn, project=project)
 
     vault_results = []
     if write_vault:
@@ -174,6 +177,8 @@ def index_to_qdrant(input_path, out_dir, state_path, store=None, ai_structure=Fa
         print(f"  {label}: {result['path']}{suffix}")
     for path in report["skipped_unchanged"]:
         print("Unchanged, skipped:", path)
+    for path in report["metadata_updated"]:
+        print("  Filter metadata updated (no re-embedding):", path)
     for path in report["skipped_unsupported"]:
         print("Unsupported, skipped:", path)
     for path in report["skipped_empty"]:
@@ -228,16 +233,21 @@ def analyze_vault(state_path, source=None, json_output=False, max_diff_lines=200
     client = obsidian or ObsidianClient()
     results = asyncio.run(analyze_managed_notes(client, state, source_filter=source,
                                                  max_diff_lines=max_diff_lines))
+    # _live_vault_body is an internal field for ingest.proposals.create_proposals
+    # to consume (the exact content a future proposal would need to
+    # capture) -- never surfaced in analyze_vault's own output, to avoid
+    # dumping potentially large document bodies into a routine report.
+    display_results = [{k: v for k, v in r.items() if k != "_live_vault_body"} for r in results]
 
     if json_output:
-        print(json_module.dumps(results, indent=2))
+        print(json_module.dumps(display_results, indent=2))
         return 0
 
-    if not results:
+    if not display_results:
         print("No managed notes found in state (nothing has been written via --write-vault yet).")
         return 0
 
-    for r in results:
+    for r in display_results:
         print(f"[{r['classification']}] {r['source_path']}")
         print(f"  managed note: {r.get('managed_note_path')}")
         print(f"  reason: {r.get('reason')}")
@@ -253,6 +263,137 @@ def analyze_vault(state_path, source=None, json_output=False, max_diff_lines=200
             if r.get("diff_truncated"):
                 print(f"    ... truncated ({r['diff_total_lines']} total diff lines)")
         print()
+    return 0
+
+
+def propose_vault_changes(state_path, proposals_dir=None, source=None, max_diff_lines=200,
+                           json_output=False, obsidian=None):
+    """Read-only entry point for `--propose-vault-changes`. Runs the
+    existing analyze_vault analysis pass, then turns each actionable
+    result into a durable proposal file via ingest.proposals.create_proposals.
+
+    Performs ZERO writes to source/Obsidian/Qdrant/sync_state.json; the
+    only writes are new proposal JSON files under proposals_dir. Existing
+    proposals for an unchanged situation are left untouched (see
+    ingest.proposals.create_proposals's idempotency contract).
+    """
+    import asyncio
+    import json as json_module
+    from ingest.obsidian_client import ObsidianClient
+    from ingest.reverse_analyzer import analyze_managed_notes
+    from ingest.proposals import create_proposals, DEFAULT_PROPOSALS_DIR
+    from sync_cli import load_state
+
+    proposals_dir = proposals_dir or DEFAULT_PROPOSALS_DIR
+    try:
+        state = load_state(state_path, namespace="local")
+    except Exception as exc:  # noqa: BLE001
+        print(f"ERROR: could not read state file {state_path}: {exc}")
+        return 1
+
+    client = obsidian or ObsidianClient()
+    results = asyncio.run(analyze_managed_notes(client, state, source_filter=source,
+                                                 max_diff_lines=max_diff_lines))
+    created = create_proposals(results, local_state=state, proposals_dir=proposals_dir, state_path=state_path)
+
+    if json_output:
+        print(json_module.dumps(created, indent=2))
+        return 0
+
+    if not created:
+        print("No actionable divergence found (nothing to propose).")
+        return 0
+
+    for c in created:
+        verb = "Created" if c["created"] else f"Already exists (status: {c['status']})"
+        print(f"[{c['classification']}] {verb}: proposal {c['proposal_id']}")
+    return 0
+
+
+def _decision_cli(proposals_dir, proposal_id, action, note, obsidian=None, state_path=None):
+    import asyncio
+    from ingest.obsidian_client import ObsidianClient
+    from ingest.proposals import approve_proposal, reject_proposal, DEFAULT_PROPOSALS_DIR
+
+    proposals_dir = proposals_dir or DEFAULT_PROPOSALS_DIR
+    if action == "approve":
+        client = obsidian or ObsidianClient()
+        result = asyncio.run(approve_proposal(proposals_dir, proposal_id, client, note=note, state_path=state_path))
+    else:
+        result = reject_proposal(proposals_dir, proposal_id, note=note)
+
+    if result["ok"]:
+        print(f"Proposal {proposal_id}: {result['status']}")
+        return 0
+    print(f"Proposal {proposal_id} NOT {action}d: {result['reason']}")
+    return 1
+
+
+def list_proposals_cli(proposals_dir=None, json_output=False):
+    import json as json_module
+    from ingest.proposals import list_proposals, DEFAULT_PROPOSALS_DIR
+
+    proposals_dir = proposals_dir or DEFAULT_PROPOSALS_DIR
+    entries = list_proposals(proposals_dir)
+
+    if json_output:
+        print(json_module.dumps([
+            {"proposal": p, "error": e} for p, e in entries
+        ], indent=2))
+        return 0
+
+    if not entries:
+        print(f"No proposals found in {proposals_dir}.")
+        return 0
+
+    for proposal, error in entries:
+        if error:
+            print(f"[UNREADABLE] {error}")
+            continue
+        print(f"[{proposal['status'].upper()}] {proposal['proposal_id']}  "
+              f"{proposal['classification']}  {proposal['source_path']}")
+    return 0
+
+
+def show_proposal_cli(proposal_id, proposals_dir=None, json_output=False):
+    import json as json_module
+    from ingest.proposals import load_proposal, DEFAULT_PROPOSALS_DIR
+
+    proposals_dir = proposals_dir or DEFAULT_PROPOSALS_DIR
+    proposal, error = load_proposal(proposals_dir, proposal_id)
+    if proposal is None:
+        print(f"ERROR: {error}")
+        return 1
+
+    if json_output:
+        print(json_module.dumps(proposal, indent=2))
+        return 0
+
+    print(f"Proposal:        {proposal['proposal_id']}")
+    print(f"Status:          {proposal['status']}")
+    print(f"Classification:  {proposal['classification']}")
+    print(f"Proposed action: {proposal['proposed_action']}")
+    print(f"Source:          {proposal['source_path']}")
+    print(f"Managed note:    {proposal['managed_note_path']}")
+    print(f"Created:         {proposal['created_at']}")
+    print(f"Reason:          {proposal['reason']}")
+    fp = proposal["fingerprints"]
+    print("Fingerprints:")
+    print(f"  source_sha256:             {fp.get('source_sha256')}")
+    print(f"  expected_generated_sha256: {fp.get('expected_generated_sha256')}")
+    print(f"  live_vault_sha256:         {fp.get('live_vault_sha256')}")
+    if proposal.get("ai_structured"):
+        print(f"AI structured:   true (model: {proposal.get('structure_model')})")
+    decision = proposal.get("decision") or {}
+    if decision.get("status"):
+        print(f"Decision:        {decision['status']} at {decision['decided_at']}"
+              + (f" -- {decision['note']}" if decision.get("note") else ""))
+    if proposal.get("diff"):
+        print("Diff (cortex_generated -> vault_current):")
+        for line in proposal["diff"]:
+            print(f"  {line}")
+        if proposal.get("diff_truncated"):
+            print(f"  ... truncated ({proposal['diff_total_lines']} total diff lines)")
     return 0
 
 
@@ -297,9 +438,51 @@ def main():
     parser.add_argument("--max-diff-lines", type=int, default=200, dest="max_diff_lines",
                          help="With --analyze-vault: truncate unified diffs for HUMAN_MODIFIED "
                               "notes after this many lines (default: 200).")
+    parser.add_argument("--propose-vault-changes", action="store_true", dest="propose_vault_changes",
+                         help="READ-ONLY apart from writing new proposal files: runs the same "
+                              "analysis as --analyze-vault and creates a durable, reviewable "
+                              "proposal (state/proposals/<id>.json) for every actionable "
+                              "divergence (everything except IN_SYNC/ANALYSIS_INSUFFICIENT_STATE). "
+                              "Never modifies source/Obsidian/Qdrant/sync_state.json.")
+    parser.add_argument("--approve-proposal", default=None, dest="approve_proposal",
+                         help="Approve a pending proposal by id. Re-verifies live source/vault "
+                              "fingerprints first; if anything drifted since the proposal was "
+                              "created, marks it 'stale' instead of approving. Only ever writes "
+                              "to the proposal's own JSON file -- never source/Obsidian/Qdrant/"
+                              "sync_state.json.")
+    parser.add_argument("--reject-proposal", default=None, dest="reject_proposal",
+                         help="Reject a pending (or stale) proposal by id. Does not require live "
+                              "fingerprints to still match. Only ever writes to the proposal's "
+                              "own JSON file.")
+    parser.add_argument("--decision-note", default=None, dest="decision_note",
+                         help="Optional human-readable note attached to --approve-proposal or "
+                              "--reject-proposal's decision record.")
+    parser.add_argument("--list-proposals", action="store_true", dest="list_proposals",
+                         help="List every proposal under --proposals-dir with its status.")
+    parser.add_argument("--show-proposal", default=None, dest="show_proposal",
+                         help="Show one proposal's full details (fingerprints, diff, decision) by id.")
+    parser.add_argument("--proposals-dir", type=Path, default=None, dest="proposals_dir",
+                         help="Directory for proposal JSON files (default: state/proposals/ "
+                              "next to this repository).")
+    parser.add_argument("--project", default=None,
+                         help="Requires --index. Project name stored as filterable search metadata "
+                              "on every indexed chunk (overrides a 'project:' in the document's "
+                              "frontmatter).")
     parser.add_argument("--state", type=Path, default=Path(__file__).with_name("sync_state.json"),
                          help="Path to the shared sync state file (default: sync_state.json)")
     args = parser.parse_args()
+
+    if args.propose_vault_changes:
+        return propose_vault_changes(args.state, proposals_dir=args.proposals_dir, source=args.source,
+                                      max_diff_lines=args.max_diff_lines, json_output=args.json_output)
+    if args.approve_proposal:
+        return _decision_cli(args.proposals_dir, args.approve_proposal, "approve", args.decision_note, state_path=args.state)
+    if args.reject_proposal:
+        return _decision_cli(args.proposals_dir, args.reject_proposal, "reject", args.decision_note)
+    if args.list_proposals:
+        return list_proposals_cli(proposals_dir=args.proposals_dir, json_output=args.json_output)
+    if args.show_proposal:
+        return show_proposal_cli(args.show_proposal, proposals_dir=args.proposals_dir, json_output=args.json_output)
 
     if args.analyze_vault:
         return analyze_vault(args.state, source=args.source, json_output=args.json_output,
@@ -312,10 +495,13 @@ def main():
         parser.error("--ai-structure requires --index")
     if args.write_vault and not args.index:
         parser.error("--write-vault requires --index")
+    if args.project and not args.index:
+        parser.error("--project requires --index")
 
     if args.index:
         return index_to_qdrant(args.input, args.out, args.state, ai_structure=args.ai_structure,
-                                write_vault=args.write_vault, managed_vault_dir=args.managed_vault_dir)
+                                write_vault=args.write_vault, managed_vault_dir=args.managed_vault_dir,
+                                project=args.project)
 
     out_dir = args.out or "vault"
     extract_to_markdown(args.input, out_dir)

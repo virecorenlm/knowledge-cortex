@@ -31,16 +31,33 @@ def _obsidian():
 
 
 @server.tool()
-def semantic_search(query: str, limit: int = 5) -> str:
+def semantic_search(query: str, limit: int = 5, source: list[str] | None = None,
+                    project: list[str] | None = None, tags: list[str] | None = None,
+                    tag_mode: str = "all", date_from: str = "", date_to: str = "") -> str:
     """Search the Knowledge Cortex vector index (Obsidian vault content,
     embedded with qwen3-embedding:4b) for the chunks most relevant to a
     natural-language question. Returns ranked chunks with source path,
-    chunk text, and similarity score, as a JSON string."""
+    chunk text, similarity score, and metadata (project, tags, doc_date),
+    as a JSON string.
+
+    Optional filters (combined with AND):
+      source:    any of these origins: "obsidian" (vault notes), "local_ingest" (local files)
+      project:   any of these project names (vault notes default to their top-level folder)
+      tags:      tag names without "#"; nested tags match their parents ("a" matches "a/b")
+      tag_mode:  "all" (every tag required, default) or "any"
+      date_from / date_to: ISO dates (YYYY-MM-DD or full datetime), inclusive,
+                 on the document's date; excludes chunks with no known date"""
     store = _store()
-    results = store.search(
-        query, limit=limit,
-        instruct="Given a web search query, retrieve relevant passages that answer the query",
-    )
+    filters = {"source": source, "project": project, "tags": tags, "tag_mode": tag_mode,
+               "date_from": date_from or None, "date_to": date_to or None}
+    try:
+        results = store.search(
+            query, limit=limit,
+            instruct="Given a web search query, retrieve relevant passages that answer the query",
+            filters=filters,
+        )
+    except ValueError as exc:
+        return json.dumps({"error": str(exc)}, ensure_ascii=False)
     return json.dumps(results, ensure_ascii=False, indent=2)
 
 

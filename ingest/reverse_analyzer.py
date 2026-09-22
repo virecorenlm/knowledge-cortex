@@ -185,6 +185,13 @@ async def _analyze_one(obsidian, source_file, entry, max_diff_lines):
     current = await obsidian.read_note(dest_path)
     current_fm, current_body = parse_frontmatter(current["content"])
     result["current_vault_sha256"] = hash_managed_body(current_body)
+    # Full live body text, kept out of the human-readable/JSON-default
+    # rendering (main.py's analyze_vault only prints the summary fields)
+    # but available to callers that need the EXACT reviewed content for a
+    # durable record -- notably ingest.proposals.create_proposals, which
+    # must capture precisely what a human would be approving, not just
+    # its hash (see that module's docstring for why).
+    result["_live_vault_body"] = current_body
 
     if current_fm.get("cortex_managed") != "true":
         result["classification"] = "UNMANAGED_AT_TARGET"
