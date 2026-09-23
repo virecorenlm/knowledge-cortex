@@ -94,6 +94,7 @@ def _hash_body(body):
 CORTEX_FRONTMATTER_KEYS = (
     "cortex_managed", "cortex_source_id", "cortex_source_path", "cortex_source_sha256",
     "cortex_generated_sha256", "cortex_last_write", "cortex_prompt_version", "cortex_structure_model",
+    "cortex_document_id",
 )
 
 
@@ -136,6 +137,28 @@ async def _note_exists(obsidian, path):
     directory, _, name = path.rpartition("/")
     entries = await obsidian.list_dir(directory)
     return name in entries
+
+
+def update_cortex_frontmatter(content, updates):
+    """Return `content` with the given cortex_* frontmatter keys set, every
+    other frontmatter line and the whole body kept byte-for-byte. Existing
+    `key: value` lines are replaced in place; missing keys are appended at
+    the end of the block. Raises ValueError for non-cortex keys or a note
+    without a frontmatter block."""
+    if any(not key.startswith("cortex_") or not re.fullmatch(r"cortex_[a-z0-9_]+", key) for key in updates):
+        raise ValueError("only cortex_* frontmatter keys may be updated")
+    match = FRONTMATTER_RE.match(content)
+    if not match:
+        raise ValueError("note has no frontmatter block")
+    lines = match.group(1).split("\n")
+    remaining = dict(updates)
+    for i, line in enumerate(lines):
+        key, sep, _ = line.partition(":")
+        if sep and key in remaining:
+            lines[i] = f"{key}: {remaining.pop(key)}"
+    lines.extend(f"{k}: {v}" for k, v in remaining.items())
+    separator = "\n" if match.group(0).endswith("---\n\n") else ""
+    return "---\n" + "\n".join(lines) + "\n---\n" + separator + content[match.end():]
 
 
 # Public aliases for the private helpers above, for reuse by other modules
@@ -192,6 +215,15 @@ async def write_managed_note(obsidian, dest_path, generated_body, metadata):
     that source.
     """
     generated_hash = _hash_body(generated_body)
+    frontmatter = managed_frontmatter(generated_body, metadata)
+    exists = await _note_exists(obsidian, dest_path)
+    return await _write_with_frontmatter(obsidian, dest_path, generated_body, generated_hash, frontmatter, exists)
+
+
+def managed_frontmatter(generated_body, metadata):
+    """The cortex ownership frontmatter for a note holding generated_body
+    (see module docstring); cortex_document_id only when metadata has one."""
+    generated_hash = _hash_body(generated_body)
     frontmatter = {
         "cortex_managed": "true",
         "cortex_source_id": source_id_for(metadata["source_path"]),
@@ -202,8 +234,12 @@ async def write_managed_note(obsidian, dest_path, generated_body, metadata):
         "cortex_prompt_version": metadata.get("prompt_version") or "",
         "cortex_structure_model": metadata.get("structure_model") or "",
     }
+    if metadata.get("document_id"):
+        frontmatter["cortex_document_id"] = metadata["document_id"]
+    return frontmatter
 
-    exists = await _note_exists(obsidian, dest_path)
+
+async def _write_with_frontmatter(obsidian, dest_path, generated_body, generated_hash, frontmatter, exists):
 
     if not exists:
         await obsidian.write_note(dest_path, _build_note(generated_body, frontmatter))

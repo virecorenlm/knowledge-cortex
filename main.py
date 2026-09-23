@@ -1,4 +1,5 @@
 import argparse
+import os
 
 from ingest.detect import detect_file_type
 from ingest.extract import extract_text
@@ -311,17 +312,55 @@ def propose_vault_changes(state_path, proposals_dir=None, source=None, max_diff_
     return 0
 
 
-def _decision_cli(proposals_dir, proposal_id, action, note, obsidian=None, state_path=None):
+def authorize_proposal_actor(proposals_dir, proposal_id, user, capability, cortex_db=None):
+    """Multi-user gate for proposal decisions/apply. Returns None when allowed,
+    else an error string. With the default user and no Cortex store, nothing
+    is checked (single-user installs behave exactly as before, and no store is
+    created). Otherwise the user must exist and hold `capability` on the
+    registered document for the proposal's source; unregistered sources are
+    admin-only. Fails closed."""
+    from cortex.db import DEFAULT_DB_PATH, DEFAULT_USER, CortexError
+    from ingest.proposals import load_proposal
+    db_path = cortex_db or os.getenv("CORTEX_DB") or DEFAULT_DB_PATH
+    if user == DEFAULT_USER and not os.path.exists(db_path):
+        return None
+    if not os.path.exists(db_path):
+        return f"unknown user {user!r} (no Cortex store at {db_path})"
+    from cortex.db import CortexDB
+    from cortex.identity import find_by_source
+    from cortex.users import authorize
+    proposal, error = load_proposal(proposals_dir, proposal_id)
+    if proposal is None:
+        return None  # the action itself reports the load error without writing anything
+    db = CortexDB(db_path)
+    try:
+        authorize(db, user, capability, find_by_source(db, proposal.get("source_path")))
+    except CortexError as exc:
+        return str(exc)
+    finally:
+        db.close()
+    return None
+
+
+def _decision_cli(proposals_dir, proposal_id, action, note, obsidian=None, state_path=None, user=None,
+                  cortex_db=None):
     import asyncio
+    from cortex.db import DEFAULT_USER
     from ingest.obsidian_client import ObsidianClient
     from ingest.proposals import approve_proposal, reject_proposal, DEFAULT_PROPOSALS_DIR
 
     proposals_dir = proposals_dir or DEFAULT_PROPOSALS_DIR
+    user = user or os.getenv("CORTEX_USER") or DEFAULT_USER
+    denied = authorize_proposal_actor(proposals_dir, proposal_id, user, "approve", cortex_db)
+    if denied:
+        print(f"Proposal {proposal_id} NOT {action}d: {denied}")
+        return 1
     if action == "approve":
         client = obsidian or ObsidianClient()
-        result = asyncio.run(approve_proposal(proposals_dir, proposal_id, client, note=note, state_path=state_path))
+        result = asyncio.run(approve_proposal(proposals_dir, proposal_id, client, note=note, state_path=state_path,
+                                              actor=user))
     else:
-        result = reject_proposal(proposals_dir, proposal_id, note=note)
+        result = reject_proposal(proposals_dir, proposal_id, note=note, actor=user)
 
     if result["ok"]:
         print(f"Proposal {proposal_id}: {result['status']}")
@@ -331,7 +370,7 @@ def _decision_cli(proposals_dir, proposal_id, action, note, obsidian=None, state
 
 
 def apply_proposal_cli(proposal_id, proposals_dir=None, state_path=None, dry_run=False, backups_dir=None,
-                       json_output=False, max_diff_lines=200, obsidian=None):
+                       json_output=False, max_diff_lines=200, obsidian=None, user=None, cortex_db=None):
     """Entry point for `--apply-proposal`: writes the exact reviewed vault
     body of an approved HUMAN_MODIFIED proposal back into its .md/.txt
     source after re-validating the frozen snapshot (see ingest/apply.py).
@@ -344,11 +383,17 @@ def apply_proposal_cli(proposal_id, proposals_dir=None, state_path=None, dry_run
     from ingest.obsidian_client import ObsidianClient
     from ingest.proposals import DEFAULT_PROPOSALS_DIR
 
+    from cortex.db import DEFAULT_USER
     proposals_dir = proposals_dir or DEFAULT_PROPOSALS_DIR
-    client = obsidian or ObsidianClient()
-    result = asyncio.run(apply_proposal(proposals_dir, proposal_id, client, state_path=state_path,
-                                        dry_run=dry_run, backups_dir=backups_dir,
-                                        max_diff_lines=max_diff_lines))
+    user = user or os.getenv("CORTEX_USER") or DEFAULT_USER
+    denied = authorize_proposal_actor(proposals_dir, proposal_id, user, "apply", cortex_db)
+    if denied:
+        result = {"ok": False, "status": "unauthorized", "reason": denied}
+    else:
+        client = obsidian or ObsidianClient()
+        result = asyncio.run(apply_proposal(proposals_dir, proposal_id, client, state_path=state_path,
+                                            dry_run=dry_run, backups_dir=backups_dir,
+                                            max_diff_lines=max_diff_lines, actor=user))
     if json_output:
         print(json_module.dumps(result, indent=2))
         return 0 if result["ok"] else 1
@@ -635,6 +680,10 @@ def main():
     parser.add_argument("--create-payload-indexes", action="store_true", dest="create_payload_indexes",
                          help="Explicitly create any missing Qdrant payload indexes used by --search "
                               "filters on the existing collection (idempotent).")
+    parser.add_argument("--user", default=None,
+                         help="Acting Cortex user for --approve-proposal/--reject-proposal/--apply-proposal "
+                              "(default: CORTEX_USER or 'local'). Recorded in the proposal; checked against "
+                              "the Cortex authorization layer when a Cortex store exists.")
     parser.add_argument("--list-proposals", action="store_true", dest="list_proposals",
                          help="List every proposal under --proposals-dir with its status.")
     parser.add_argument("--show-proposal", default=None, dest="show_proposal",
@@ -673,14 +722,16 @@ def main():
     if args.apply_proposal:
         return apply_proposal_cli(args.apply_proposal, proposals_dir=args.proposals_dir, state_path=args.state,
                                   dry_run=args.dry_run, backups_dir=args.backup_dir,
-                                  json_output=args.json_output, max_diff_lines=args.max_diff_lines)
+                                  json_output=args.json_output, max_diff_lines=args.max_diff_lines,
+                                  user=args.user)
     if args.propose_vault_changes:
         return propose_vault_changes(args.state, proposals_dir=args.proposals_dir, source=args.source,
                                       max_diff_lines=args.max_diff_lines, json_output=args.json_output)
     if args.approve_proposal:
-        return _decision_cli(args.proposals_dir, args.approve_proposal, "approve", args.decision_note, state_path=args.state)
+        return _decision_cli(args.proposals_dir, args.approve_proposal, "approve", args.decision_note,
+                             state_path=args.state, user=args.user)
     if args.reject_proposal:
-        return _decision_cli(args.proposals_dir, args.reject_proposal, "reject", args.decision_note)
+        return _decision_cli(args.proposals_dir, args.reject_proposal, "reject", args.decision_note, user=args.user)
     if args.list_proposals:
         return list_proposals_cli(proposals_dir=args.proposals_dir, json_output=args.json_output)
     if args.show_proposal:

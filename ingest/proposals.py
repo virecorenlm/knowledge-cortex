@@ -368,7 +368,7 @@ async def _current_generated_baseline(source_path, local_state_loader):
     return hash_managed_body(body), None
 
 
-async def approve_proposal(proposals_dir, proposal_id, obsidian, note=None, state_path=None):
+async def approve_proposal(proposals_dir, proposal_id, obsidian, note=None, state_path=None, actor=None):
     """Approve a pending proposal, IF AND ONLY IF:
       1. the proposal passes its own internal-consistency checks
          (proposal_id matches its material fields, reviewed_live_vault_body
@@ -437,6 +437,8 @@ async def approve_proposal(proposals_dir, proposal_id, obsidian, note=None, stat
 
     proposal["status"] = "approved"
     proposal["decision"] = {"status": "approved", "decided_at": datetime.now().isoformat(), "note": note}
+    if actor:
+        proposal["decision"]["actor"] = actor
     _atomic_write_json(_proposal_path(proposals_dir, proposal_id), proposal)
     return {"ok": True, "status": "approved", "reason": None}
 
@@ -495,7 +497,7 @@ async def detect_drift(proposal, obsidian, state_path):
     return drift_reasons
 
 
-def reject_proposal(proposals_dir, proposal_id, note=None):
+def reject_proposal(proposals_dir, proposal_id, note=None, actor=None):
     """Reject a proposal. Unlike approval, rejection does NOT require live
     fingerprints to still match -- a human may reject an outdated proposal
     freely. Terminal decisions ("approved"/"rejected") are still immutable:
@@ -513,5 +515,7 @@ def reject_proposal(proposals_dir, proposal_id, note=None):
 
     proposal["status"] = "rejected"
     proposal["decision"] = {"status": "rejected", "decided_at": datetime.now().isoformat(), "note": note}
+    if actor:
+        proposal["decision"]["actor"] = actor
     _atomic_write_json(_proposal_path(proposals_dir, proposal_id), proposal)
     return {"ok": True, "status": "rejected", "reason": None}

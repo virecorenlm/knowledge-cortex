@@ -372,7 +372,7 @@ def _apply_record(proposal, raw_before, info, backup_path, recovered, warnings=(
 
 
 async def apply_proposal(proposals_dir, proposal_id, obsidian, state_path=None, dry_run=False,
-                         backups_dir=None, max_diff_lines=200):
+                         backups_dir=None, max_diff_lines=200, actor=None):
     """Apply one approved proposal (see module docstring). Returns a dict
     {"ok", "status", "reason", ...details}. Statuses: applied, would_apply
     (dry-run), recovered, would_recover (dry-run), already_applied (ok);
@@ -481,8 +481,10 @@ async def apply_proposal(proposals_dir, proposal_id, obsidian, state_path=None, 
                        "SOURCE WAS REPLACED BUT POST-WRITE VERIFICATION FAILED: " + "; ".join(problems)
                        + f". Restore from the backup if needed: {backup_path}", **details)
 
-    return _finalize(proposal, proposal_file, _apply_record(proposal, raw_before, info, backup_path, False),
-                     "applied", details)
+    record = _apply_record(proposal, raw_before, info, backup_path, False)
+    if actor:
+        record["actor"] = actor
+    return _finalize(proposal, proposal_file, record, "applied", details)
 
 
 def _finalize(proposal, proposal_file, record, status, details):

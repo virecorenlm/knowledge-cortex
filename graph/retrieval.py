@@ -17,6 +17,11 @@ VectorStore.upsert_chunks; see README "Hybrid retrieval"):
                                  is treated as false (vault notes are never
                                  AI-structured)
     doc_date       RFC3339|null  every chunk with filter metadata          gte, gt, lte, lt
+    document_id    keyword       chunks of Cortex-registered documents      eq, in, not_in
+                                 (payload set by cortex/sync_engine.py)
+    revision_id    keyword       same; the revision the chunk was indexed   eq, in, not_in
+                                 from (history collection: every revision)
+    indexed_at     RFC3339       same; when Cortex last indexed the chunk   gte, gt, lte, lt
 
 There is no stored file-type field and no native keyword-prefix match, so
 source_type and path-prefix filters are deliberately unsupported (vault
@@ -103,9 +108,12 @@ FIELDS = {
     "source_file": "keyword",
     "ai_structured": "bool",
     "doc_date": "datetime",
+    "document_id": "keyword",
+    "revision_id": "keyword",
+    "indexed_at": "datetime",
 }
 _OPS = {
-    "keyword": {"eq", "in"},
+    "keyword": {"eq", "in", "not_in"},
     "tags": {"contains", "contains_any", "contains_all"},
     "bool": {"eq"},
     "datetime": {"gte", "gt", "lte", "lt"},
@@ -224,8 +232,10 @@ def _match(field, values):
     return models.FieldCondition(key=field, match=models.MatchAny(any=values))
 
 
-def build_qdrant_filter(normalized):
-    must = []
+def build_qdrant_filter(normalized, exclude_document_ids=None):
+    must, must_not = [], []
+    if exclude_document_ids:
+        must_not.append(_match("document_id", sorted(set(exclude_document_ids))))
     for field, (op, value) in normalized.items():
         if op == "range":
             must.append(models.FieldCondition(key=field, range=models.DatetimeRange(**value)))
@@ -239,9 +249,13 @@ def build_qdrant_filter(normalized):
             must.append(_match(field, [value]))
         elif op in ("in", "contains_any"):
             must.append(_match(field, value))
+        elif op == "not_in":
+            must_not.append(_match(field, value))
         else:  # contains_all
             must.extend(_match(field, [v]) for v in value)
-    return models.Filter(must=must) if must else None
+    if not must and not must_not:
+        return None
+    return models.Filter(must=must or None, must_not=must_not or None)
 
 
 def describe_filter(field, op, value):
@@ -286,6 +300,8 @@ def preference_match(field, op, value, payload):
         if op == "contains_all":
             return 1.0 if set(wanted) <= have else 0.0
         return sum(1 for t in wanted if t in have) / len(wanted)
+    if op == "not_in":
+        return 1.0 if not (isinstance(actual, str) and actual in value) else 0.0
     wanted = [value] if op == "eq" else value
     return 1.0 if isinstance(actual, str) and actual in wanted else 0.0
 
@@ -330,7 +346,7 @@ def _sort_key(item):
 
 
 def hybrid_search(store, query, limit=10, filters=None, prefer=None, max_per_source=None,
-                  instruct=None, config=DEFAULT_RANKING, with_timings=False):
+                  instruct=None, config=DEFAULT_RANKING, with_timings=False, exclude_document_ids=None):
     """Run one hybrid retrieval. Returns a response dict (see module
     docstring and README for the schema). Raises ValueError for invalid
     arguments before anything is embedded or queried. Read-only."""
@@ -346,9 +362,9 @@ def hybrid_search(store, query, limit=10, filters=None, prefer=None, max_per_sou
     hard = normalize_filters(filters)
     soft = normalize_preferences(prefer, config)
     metadata_only = not query
-    if metadata_only and not hard:
+    if metadata_only and not hard and not exclude_document_ids:
         raise ValueError("metadata-only retrieval (empty query) requires at least one hard filter")
-    qfilter = build_qdrant_filter(hard)
+    qfilter = build_qdrant_filter(hard, exclude_document_ids)
     mode = "metadata_only" if metadata_only else ("hybrid" if hard or soft or max_per_source else "semantic")
     pool = config.metadata_only_max if metadata_only else candidate_limit(limit, soft, max_per_source, config)
     response = {

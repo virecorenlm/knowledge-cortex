@@ -26,6 +26,15 @@ Local files (PDF/DOCX/TXT/Markdown) enter the same pipeline via `main.py --index
 
 Qdrant is the persistent vector-store layer. Ollama provides the embedding model. ChromaDB and the old in-process FAISS index are not used.
 
+On top of this pipeline, the Knowledge Cortex layer (`cortex/`, `cortex_cli.py`) adds several capabilities, with a local SQLite store for identity, history and the journal. See "Knowledge Cortex" below for the architecture diagram.
+- stable document identity
+- bidirectional source ↔ vault sync (merge, renames, tombstoned deletes)
+- immutable revision history
+- temporal retrieval
+- evidence-cited synthesis
+- local users and authorization
+- concurrent-edit conflict resolution
+
 ## Current Features
 
 - Recursive Obsidian vault walking over MCP (`ingest/obsidian_client.py`)
@@ -35,9 +44,10 @@ Qdrant is the persistent vector-store layer. Ollama provides the embedding model
 - Qdrant-backed vector storage with vector-size validation, so an accidental embedding-model mismatch fails loudly instead of corrupting a collection
 - Incremental vault sync AND incremental local-file ingestion: unchanged content (by sha256) is skipped on repeat runs, tracked in `sync_state.json` under independent `vault`/`local` namespaces so the two sources never collide
 - One bad file in a batch (extraction failure, embedding failure) is reported and skipped — it never aborts the rest of the batch or corrupts the saved state for other files
-- An MCP server (`mcp_server.py`) exposing `semantic_search`, `sync_vault`, and `index_status` as tools, so any MCP client (including Hermes) can query the index directly
+- An MCP server (`mcp_server.py`) exposing `semantic_search`, `hybrid_search`, `sync_vault` and `index_status`, plus the Cortex tools (sync status/document, history, revisions, temporal search, synthesis, conflicts), so any MCP client (including Hermes) can query the index directly
+- The Knowledge Cortex layer (`cortex/`): bidirectional sync with deterministic merges, rename and delete propagation (tombstones, recovery areas), immutable revisions, `as_of` and valid-time retrieval, cited and stale-aware synthesis, local users with roles, visibility and grants, and optimistic-concurrency conflicts
 - Optional AI structuring of local files (`--ai-structure`): an Ollama chat model reorganizes headings/summary/tags without altering facts, numbers, dates, URLs, or code — fails safe to raw Markdown on any error, timeout, or validation rejection
-- 81 unit tests covering chunking, storage, Obsidian walking, vault sync, local-file ingestion, namespaced state, AI structuring, and the `main.py` CLI — `python -m unittest discover -s tests`
+- 481 unit tests (see "Testing") — `python -m unittest discover -s tests`
 
 ## Requirements
 
@@ -330,7 +340,7 @@ python main.py --propose-vault-changes --proposals-dir /custom/path  # override 
 
 ## Applying an approved proposal (`--apply-proposal`)
 
-`--apply-proposal` is the first reverse write: it takes an **approved `HUMAN_MODIFIED` proposal** and writes the **exact reviewed vault body** stored in that proposal back into the original source file. **This is not bidirectional sync.** Nothing runs automatically. No other classification is applied, and there is no merging, no rename/delete propagation, and no watcher. The vault, Qdrant, and `sync_state.json` are never written.
+`--apply-proposal` is the first reverse write: it takes an **approved `HUMAN_MODIFIED` proposal** and writes the **exact reviewed vault body** stored in that proposal back into the original source file. **On its own this is not bidirectional sync** (that is `cortex/sync_engine.py`, below, which uses this layer for vault → source). Nothing runs automatically. No other classification is applied, and there is no merging, no rename/delete propagation, and no watcher. The vault, Qdrant, and `sync_state.json` are never written.
 
 ```bash
 python main.py --apply-proposal <id> --dry-run     # every check, show the source diff, write nothing
@@ -406,6 +416,195 @@ Any failure before the replace leaves the original untouched and removes the tem
 **Remaining limits (why this is not yet bidirectional sync):**
 - Only approved, non-AI-structured `HUMAN_MODIFIED` proposals for `.md`/`.txt` are applied. There is no merging and no rename/delete propagation, and nothing runs automatically.
 - There is no lock. Edits landing between the final source compare and `os.replace`, or vault edits after the drift check, are not covered.
+
+## Knowledge Cortex: identity, bidirectional sync, history, time, synthesis, users, conflicts
+
+The `cortex/` package builds the rest of the system on top of the layers above. It never bypasses them: ingestion still owns Qdrant and `sync_state.json`, `vault_writer`'s ownership contract still holds, and vault-only edits still reach sources only through analyze → propose → approve → apply. It runs locally and is explicitly invoked (`python cortex_cli.py …` or MCP tools). There are no watchers or daemons, and no new services.
+
+```
+                 ┌──────────────── cortex_cli.py / mcp_server.py (actor = --user / CORTEX_USER) ───────────────┐
+                 │                                                                                           │
+   sources ──► ingest/ (extract → document_body → chunk → embed) ──► Qdrant  <collection>  (current chunks,  │
+   (.md .txt      │            ▲                                         │      payload document_id/revision_id)
+    .pdf .docx)   │            │ reindex                                 │
+                  ▼            │                                         ├──► <collection>__history (derived:
+   cortex/sync_engine.py ──────┘  classify → act (journaled)             │     one embedding set per head revision)
+     │  │  │ preconditions on exact content · backups · atomic writes    │
+     │  │  └──► vault (managed subtree; FilesystemVault or ObsidianClient)│
+     │  └─────► proposals/apply (vault → source, explicit approval)       │
+     ▼                                                                    ▼
+   cortex/db.py  SQLite  state/cortex.db                     graph/retrieval.py hybrid_search
+     current state: documents · grants · tombstones · conflicts · synthesis status · users
+     history (append-only, trigger-enforced): revisions · heads · events (journal)
+     ▲                ▲                   ▲                        ▲
+   versions.py    temporal.py         synthesis.py (model → cited items; never writes evidence)
+   merge.py       conflicts.py        users.py (roles, visibility, grants, capabilities)
+```
+
+**Storage choice.** SQLite (stdlib `sqlite3`, one file, `state/cortex.db`, gitignored). Revisions, journal events, conflicts and document state must change together atomically, history needs indexed lookups ("current at time T"), and immutability is enforced by triggers. That combination justifies SQLite over more JSON files. It is not a server, and Qdrant remains the only vector layer. The rule "current and historical state are distinct" is structural: `documents`, `grants`, `tombstones`, `conflicts`, and synthesis/contradiction *status* are mutable current state, with optimistic row versions. `revisions`, `heads` (which revision was current when) and `events` (the journal) reject `UPDATE`/`DELETE`.
+
+### Stable identity and migration
+
+Every managed document has a durable `document_id` (UUID4). `source_path` and `vault_path` are mutable attributes of it, so renames keep the identity. The managed note carries the id as `cortex_document_id` frontmatter, stamped on first sync (frontmatter only; body untouched). Sources never receive Cortex metadata, so source renames are recognized by content fingerprint instead.
+
+**Migration** (`cortex_cli.py migrate`, or automatically on an admin's first `sync`) is idempotent. Every `sync_state.json` entry with a managed note (`vault_write.dest_path`) becomes a document owned by the default `local` user (admin, created with the store). Its cached `generated_body` becomes the base revision (`origin: system`), with the source's frontmatter block recorded for restores. Entries without a cached body register with no base: they are `INSUFFICIENT_HISTORY` until both sides agree. `sync_state.json`, proposals and existing CLI/MCP behavior keep working unchanged. Proposal records gain optional `decision.actor` / `apply.actor`, and old records still load.
+
+### Bidirectional sync state machine
+
+`cortex_cli.py sync [--dry-run] [--document ID]` classifies every document (first match wins) and acts. `--dry-run` / `sync-status` write nothing at all, not even the journal.
+
+| State | Detected when | Action (`sync`) |
+|---|---|---|
+| `UNMANAGED` | a note at the managed path is not `cortex_managed` | none (human note, never overwritten) |
+| `INVALID` | the note carries another document's id, the id appears in several notes, or several identical untracked files could be a renamed source | none; review |
+| `SOURCE_RENAMED` | source missing, and exactly one untracked file under the source roots has the base's extracted-text hash | update `source_path`, move the sync_state key and Qdrant chunks, move the note to its new default path if it was still at the old one (no-clobber) |
+| `VAULT_RENAMED` | note missing at `vault_path`; exactly one note under the managed tree carries this id | update `vault_path` only; **the source is never renamed** |
+| `SOURCE_DELETED` / `VAULT_DELETED` / `BOTH_DELETED` | files gone (and no rename evidence) | tombstone only |
+| `INSUFFICIENT_HISTORY` | no base revision and the sides differ | none |
+| `IN_SYNC` | neither side changed since the base revision | stamp `cortex_document_id` if missing |
+| `SOURCE_ONLY_CHANGED` | source extracted-text hash ≠ base | reindex (normal pipeline), write the note (precondition: note still equals the base), revision `origin: source` |
+| `VAULT_ONLY_CHANGED` | vault body ≠ base | `.md`/`.txt`: create/refresh the `HUMAN_MODIFIED` proposal (approve + apply stay explicit). Other types: vault edit preserved, reported |
+| `CONVERGED` | both changed to the same body (typically an applied proposal) | record revision (`origin: vault` with the proposal id and apply actor as provenance), refresh note frontmatter, reindex |
+| `BOTH_CHANGED` | both changed; 3-way merge is clean | revisions S (source) and V (vault) from the base, merge revision M with parents [S, V]; M written to both sides |
+| `CONFLICT` | overlapping changes, or both changed on a non-reverse-writable source | revisions S and V plus an open conflict record; **nothing written** |
+| `TOMBSTONED` | deletion propagated | none |
+
+Every write has a precondition on the exact current content (full-note hash, source bytes hash) re-read immediately before writing. A human edit arriving mid-operation makes the operation stop (`stale_precondition`), and it is journaled as failed. Unauthorized actors' documents are skipped (`skipped_unauthorized`). One document's failure never aborts the batch.
+
+### Deterministic merge (`cortex/merge.py`)
+
+The merge is line-based diff3. Each side's edits against BASE come from `difflib` opcodes. Edits are grouped while they overlap **or touch**, so edits to adjacent lines, or two insertions at the same point, share a group. A group changed by one side is applied. A group changed by both sides is applied only if both produce byte-identical text; otherwise it is a conflict region (base/left/right recorded) and nothing is written. A merge that would unbalance a code fence (```` ``` ````/`~~~`) when every input is balanced is also reported as a conflict. No model is involved, and the same inputs always give the same result. Example: BASE `A B C`, source changes `A`, vault changes `C` → clean. Both change `B` differently → conflict.
+
+### Deletes, tombstones and recovery areas
+
+Deletion is never propagated instantly and never hard-deleted:
+
+```
+delete detected ─► tombstone {document_id, deleted_at, deleted_by, deleted_from, last_source_hash, last_vault_hash}
+   ├─ restore-tombstone ─► bring back / recreate the missing side (no-clobber) ─► restored
+   └─ approve-tombstone (needs delete) ─► move the surviving side into a recovery area ─► propagated
+          ├─ restore-tombstone ─► move it back + recreate the deleted side ─► restored
+          └─ purge-tombstone (admin only) ─► permanently remove the recovery copies ─► purged
+```
+
+The recovery areas are `<managed dir>/_cortex-trash/<tombstone>/` in the vault (moved, not deleted; deliberately not dot-prefixed, because Obsidian and its REST API hide dot folders), and `state/trash/<tombstone>/` for sources (copied, fsynced, verified, and only then unlinked). A deleted `.md`/`.txt` source is recreated from its last revision plus its recorded frontmatter block; binary or AI-structured sources cannot be reconstructed, and their restore is refused. Recreating a source needs the `apply` capability. Propagation removes the document's Qdrant chunks and sync_state entry (saved in the tombstone), and restore reinstates and re-embeds them. Purge only accepts recovery paths inside the tombstone's own recovery area.
+
+**Vault backends.** Moves need a no-clobber move primitive, and both backends provide one.
+- `cortex/vault_fs.py` `FilesystemVault` (set `CORTEX_VAULT_DIR` to the vault folder) uses strict containment: no `..`, no absolute paths, and no symlink anywhere along the path.
+- The MCP `ObsidianClient` wraps the server's verified tool schemas.
+  - `vault_move(path, destination, allowOverwrite=false)`: the server refuses to overwrite an existing destination, and paths are also checked client-side.
+  - `vault_delete(path, permanent=false)`: used only by purge. On Obsidian this is **not a hard delete**: the file goes to Obsidian's trash (`.trash` or the system trash, per the user's "Deleted files" setting).
+  - Moves on the MCP backend are **opt-in** (`OBSIDIAN_ALLOW_MOVES=1`), because Obsidian's move also rewrites internal links in *other* notes that point at the moved file, a side effect outside the managed subtree. Without the flag, rename and delete propagation fail closed (`backend_unsupported`), while everything else works.
+- Validated live against `obsidian-local-rest-api` 1.0.0: create/read/update, source → vault, the proposal-based vault → source path, fail-closed then opt-in rename propagation, a human vault move, no-clobber moves, tombstones with recovery-area propagation and restore, conflict protection, final `IN_SYNC`, and cleanup. All 2,012 vault files outside the throwaway test folder were verified unchanged (path, mtime, size).
+
+### Journal and crash recovery (`cortex/journal.py`)
+
+Every mutating operation writes a `begin` event before touching any file. That event holds the full plan: preconditions, the before/intended-after hash of every file, and the exact DB changes, including revision records with precomputed ids. The operation then writes backups and files, and finally a `commit` event in the **same transaction** as the plan's DB changes. On a handled failure, files already rewritten are restored from this operation's backups (compensation), and a `fail` event records what happened.
+
+`cortex_cli.py recover` (admin) resolves operations interrupted by a crash:
+- every file at its intended after-state: the plan is replayed (`recover`)
+- every file still at its before-state: nothing is done (`rollback`)
+- mixed: files are restored from backups (`rollback`), or left for a human (`review`) with the backup paths
+
+`cortex_cli.py verify` checks the revision graph and journal invariants. Concurrent `sync` runs are serialized by a lock file next to the store.
+
+### Revisions: version control for thought evolution (`cortex/versions.py`)
+
+A revision is one content state of a logical document: the body in the managed/generated representation plus metadata. Each has an `origin` (source, vault, merge, edit, restore, resolution, system), an actor, parents (two for merges and resolutions), a transaction time, optional declared valid time, and provenance. `revision_id` is a deterministic hash of all of those fields, and `content_hash` is `sha256(content)`. History is append-only. `restore-revision` creates a **new** revision (parent = current, `metadata.restored_from`) and writes it to both sides. `history`, `show-revision` and `diff-revisions` inspect it.
+
+### Temporal context (`cortex/temporal.py`)
+
+There are two clocks, never mixed:
+- **Transaction time:** revision `created_at`, plus the append-only `heads` table recording when each revision became current. A NULL head means the document was deleted then.
+- **Valid time:** `valid_from`/`valid_to`, taken **only** from explicit source frontmatter keys. It is unknown otherwise, and never guessed.
+
+Historical search needs historical vectors. Each revision that becomes current is embedded once into the derived `<collection>__history` collection (rebuildable with `reindex-history`, which embeds every revision; SQLite stays authoritative).
+
+```bash
+python cortex_cli.py temporal-search "sync design" --as-of 2026-05-01          # what we knew at the end of that day
+python cortex_cli.py temporal-search "backups" --changed-after 2026-09-15      # what changed this week
+python cortex_cli.py temporal-search "active decisions" --valid-at 2026-03-01  # declared validity only
+python cortex_cli.py changes --after 2026-09-15 --project cortex               # change log with diff stats
+```
+
+With no time argument, `temporal-search` is exactly the current hybrid search. Date-only bounds are whole days. Documents without declared validity are counted in `unknown_validity_revisions` and excluded from `--valid-at` queries (opt back in with `include_unknown_validity`). Hybrid retrieval gained `document_id`, `revision_id` (eq/in/not_in) and `indexed_at` (range) fields, a `not_in` operator, and an `exclude_document_ids` hook. All additions are backward compatible.
+
+### Knowledge synthesis (`cortex/synthesis.py`)
+
+```bash
+python cortex_cli.py synthesize "storage decisions" --type DECISION
+python cortex_cli.py synthesize "" --type CHANGE_SUMMARY --changed-after 2026-09-01
+python cortex_cli.py check-synthesis <id>      # stale if its evidence moved on
+python cortex_cli.py resynthesize <id>         # new artifact; old one marked superseded
+```
+
+The flow is query → visibility-filtered hybrid or temporal retrieval → evidence `E1..En` → model → validation → stored artifact. The types are `SUMMARY`, `DECISION`, `CONCEPT`, `RELATIONSHIP`, `CONTRADICTION`, `OPEN_QUESTION`, `CONSENSUS`, `CHANGE_SUMMARY` (whose evidence is revision diffs) and `PROJECT_STATE`.
+
+**Provenance guarantees.** Every evidence item records `document_id`, `revision_id`, the Qdrant point id, path, chunk index, the sha256 of the exact chunk text, and the retrieval scores. The model must return JSON items that cite evidence refs. An item citing nothing, or an unknown ref, is rejected, and a response with no supported item stores nothing. The body is labelled as model-derived and lists its evidence. The artifact records model, provider and prompt version.
+
+**Identity and staleness.** The synthesis id is a hash of type, query, parameters, evidence fingerprint, model and prompt version, so re-asking returns the existing artifact. The status is `current`, `stale` or `superseded`. Content and provenance are trigger-protected, and only the status changes. Synthesis never writes sources, notes or the evidence index, which is the "synthesized knowledge never replaces evidence" rule.
+
+**Contradictions.** `CONTRADICTION` items become contradiction records. They are only auto-classified when metadata proves it: `time_dependent` (declared validity intervals don't overlap) or `superseded` (one claim's revision is an ancestor of the other's). Otherwise they are `unresolved` until a human sets a status with `resolve-contradiction`.
+
+**Model.** The model is `OllamaChatModel`, using `CORTEX_SYNTHESIS_MODEL`, else `AI_STRUCTURE_MODEL`, else the project default, called with a JSON response format. Any object with `.name`, `.provider` and `.generate()` works, and tests use fakes. A live check with `gemma4:e4b-it-qat` produced correctly cited `DECISION` items.
+
+### Multi-user cortex and authorization (`cortex/users.py`)
+
+Identity is local: there are no cloud identity providers. The acting user comes from `--user` / `CORTEX_USER` (default `local`, the migrated admin). The MCP server uses only its configured `CORTEX_USER`, and **no tool accepts a user argument**. Unknown or malformed ids and the internal `system` account are refused.
+
+| Role | Can do |
+|---|---|
+| `admin` | everything (users, recover, purge, migrate, system documents) |
+| `member` | everything on documents it owns; on others, per visibility and grants |
+| `viewer` | read only; never mutates, even with grants |
+
+Visibility is `private` (owner, admins and explicit read grants), `shared` (everyone reads; mutation needs ownership or a grant) or `system` (everyone reads, admins mutate). The capabilities are `read`, `write`, `approve`, `apply`, `delete` and `admin`. Rewriting a source (merges, resolutions, edits, restores, applying proposals) needs `apply` in addition to `write`.
+
+Visibility is enforced inside Qdrant queries: unreadable documents are excluded natively from current and historical search, from synthesis evidence, and from conflict/history listings. A synthesis is readable only by users who can read all of its evidence. Actors are recorded on revisions, journal events, tombstones, conflicts, syntheses, and proposal decisions and applies. `main.py --approve-proposal/--apply-proposal --user U` is checked against the registered document; unregistered sources are admin-only. With the default user and no Cortex store, behavior is exactly as before, and no store is created.
+
+### Concurrent edits and conflict resolution (`cortex/conflicts.py`)
+
+```bash
+python cortex_cli.py edit <doc> --file new.md --expected-revision <rev>   # optimistic concurrency
+python cortex_cli.py conflicts ; python cortex_cli.py show-conflict <id>
+python cortex_cli.py resolve-conflict <id> --action accept_vault          # or accept_source / accept_left /
+                                                                          # accept_right / manual --body-file F /
+                                                                          # deterministic_merge / accept_suggestion
+python cortex_cli.py suggest-resolution <id>                              # AI suggestion: stored, never applied
+```
+
+An edit applies only if `expected_revision` is still current and the files are in sync. If another change became current meanwhile, the edit is 3-way merged with `base = expected`. A clean result becomes a merge revision with parents [current, edit]. Overlap becomes a `concurrent_edit` conflict (left = current, right = the edit), and nothing is written: it is never last-write-wins. Sync conflicts (left = source, right = vault) resolve the same way.
+
+Every resolution first re-checks that both files still hold exactly what was observed when the conflict was recorded. It then writes a `resolution` revision with parents [left, right] to both sides, and marks the conflict resolved in the same transaction. Resolved and superseded conflicts are immutable (audit trail). An AI suggestion is stored on the conflict as `status: suggestion, applied: false`, and applies only through an explicit `accept_suggestion` by an authorized actor.
+
+### Cortex CLI and MCP
+
+`cortex_cli.py` (JSON output; exit 1 with `{"error", "code"}` on refusal) has these commands: `migrate`, `sync`, `sync-status`, `recover`, `verify`, `journal`, `tombstones`, `approve-tombstone`, `restore-tombstone`, `purge-tombstone`, `documents`, `history`, `show-revision`, `diff-revisions`, `restore-revision`, `edit`, `conflicts`, `show-conflict`, `resolve-conflict`, `suggest-resolution`, `temporal-search`, `changes`, `reindex-history`, `synthesize`, `list-syntheses`, `show-synthesis`, `check-synthesis`, `resynthesize`, `resolve-contradiction`, `users`, `add-user`, `grant` and `set-visibility`. Global options are `--user`, `--cortex-db`, `--state`, `--vault-dir`, `--managed-dir`, `--proposals-dir`, `--source-root` and `--no-index`.
+
+The new MCP tools are `sync_status`, `sync_document`, `history`, `get_revision`, `temporal_search`, `synthesize`, `list_syntheses`, `get_synthesis`, `list_conflicts`, `get_conflict` and `resolve_conflict`. They are subject to the same authorization, preconditions and journal as the CLI. There is deliberately no MCP tool for arbitrary file writes, tombstone approval or purge, edits, restores, or user management.
+
+### Safety invariants
+
+1. Human edits win: a write needs the exact current content as a precondition, and divergence stops it or becomes a conflict.
+2. Only deterministic, non-overlapping merges are automatic; anything uncertain is a conflict.
+3. Every mutation is journaled with an actor, backed up, atomic per file, compensated on failure, and recoverable after a crash.
+4. Deletes are tombstoned and moved to recovery areas; permanent deletion is an explicit admin purge.
+5. Identity survives renames; renames are only inferred from unambiguous evidence.
+6. History (revisions, heads, journal, resolved conflicts, synthesis content) is append-only and trigger-enforced.
+7. Synthesis cites exact evidence, never writes evidence, and goes stale rather than silently outdated.
+8. AI output (synthesis, conflict suggestions) never becomes authoritative on its own.
+9. Nothing runs on import; tests never touch production collections or the default store.
+
+### Limitations
+
+- On the Obsidian MCP backend, rename and delete propagation need `OBSIDIAN_ALLOW_MOVES=1`, which accepts Obsidian's link rewriting in notes that link to a moved managed note. Creating a note there is check-then-write (the server has no create-only tool), so a note appearing in between could be overwritten. The window is tiny, and it only affects Cortex's own deterministic paths. Empty folders cannot be removed through the API.
+- A source renamed *and* edited before a sync looks like a delete plus an untracked new file (conservative).
+- Multi-user identity is a local trust model: `--user`/`CORTEX_USER` is asserted, not authenticated. Content that is not a registered Cortex document (e.g. vault notes indexed by `sync_cli.py`) is treated as legacy shared.
+- Merges are line-based (no Markdown AST), and adjacent-line edits conservatively conflict.
+- Each change rewrites the single `sync_state.json` (O(size) per change). The no-op sync scan is linear (400 documents in about 0.1 s on the local vault backend).
+- The Qdrant `markdown_path` (`local_ingest/<file name>`) is basename-based (pre-existing), so a rename onto another tracked source's file name is refused as a collision.
+- The history collection embeds head revisions automatically. Branch revisions (conflict sides) are embedded only by `reindex-history`.
+- A synthesis's deterministic id identifies the question/evidence/model tuple. It does not guarantee the model would produce the same text again.
 
 ## Semantic search — CLI
 
@@ -558,6 +757,7 @@ Tools exposed:
 |---|---|
 | `semantic_search(query, limit=5, source=None, project=None, tags=None, tag_mode="all", date_from="", date_to="")` | Search the vector index, optionally filtered by metadata (see above); returns ranked chunks with path, text, score, and metadata as JSON (or `{"error": ...}` for invalid filters) |
 | `hybrid_search(query="", limit=10, filters=None, prefer=None, max_per_source=0, include_scores=true)` | Hybrid retrieval (see "Hybrid retrieval"): hard `filters` and soft `prefer` objects using the metadata field contract, optional per-source cap; returns the full response JSON with per-result score breakdown and provenance (`include_scores=false` drops the breakdown), or `{"error": ...}`. An empty query is metadata-only listing and needs a filter. Raw Qdrant filter JSON is never accepted. |
+| `sync_status` / `sync_document` / `history` / `get_revision` / `temporal_search` / `synthesize` / `list_syntheses` / `get_synthesis` / `list_conflicts` / `get_conflict` / `resolve_conflict` | Knowledge Cortex tools (see "Knowledge Cortex"): acting user is the server's `CORTEX_USER` only; same authorization, preconditions and journal as `cortex_cli.py`; no generic file-mutation tool |
 | `sync_vault(root="", full=false)` | Index/re-index vault notes into Qdrant; incremental unless `full=true` |
 | `index_status()` | Report collection name, point count, and embedding model in use |
 
@@ -583,7 +783,7 @@ Verify with `hermes mcp test knowledge_cortex`, then `/reload-mcp` in an active 
 python -m unittest discover -s tests -v
 ```
 
-368 tests cover metadata filters (frontmatter/tag/date extraction, filtered search by source/project/tags/date ranges, local-file payload backfill without re-embedding, MCP filter pass-through), chunking (splitting/reconstruction/ID stability/metadata merging), the vector store (upsert/search/reindex/dimension-mismatch/idempotency/metadata payloads, against an in-memory Qdrant instance and a fake Ollama client — no live services required), the Obsidian vault walker (nested directories, exclusion filtering, no infinite loops), the vault sync orchestrator (first run, unchanged-skip, changed-reindex, error isolation), local-file ingestion (single file, recursive directory, unchanged/changed/no-orphans, unsupported files, one-bad-file-does-not-abort-batch, source metadata), namespaced sync-state persistence (vault/local isolation, legacy-format migration), AI structuring (invocation, structured text reaching the store, provenance metadata, safe fallback on request failure, safe fallback on empty/invalid output, incremental skip/reprocess on source-change/flag-toggle/model-change, directory ingestion with structuring enabled, configurable timeout precedence, failed-attempt retry semantics, ai_structured metadata correctness), managed vault write-back (create/conflict/safe-update/human-edit-detection/skip-on-unchanged/frontmatter-provenance/hash-excludes-frontmatter/already-in-sync rebaseline that never drops non-cortex frontmatter, all against an in-memory fake Obsidian client), the read-only reverse-sync analyzer (all 8 classifications, diff generation and truncation, precedence, zero-writes-to-vault/source/state, multiple-notes-in-one-run, one-invalid-note-does-not-block-others, legacy-state safe classification), durable change proposals (deterministic ID derivation and drift-sensitivity, idempotent regeneration, atomic writes, round-tripping, malformed/unsupported-schema-version safe failure, staleness detection on source/vault/note drift, terminal-decision immutability in both directions, zero writes to source/vault/Qdrant/sync_state on approval or rejection), the apply layer (exact reviewed body into `.md`/`.txt`, source-frontmatter preservation, no Cortex-frontmatter leakage, unsupported types/classifications/AI-structured refused with zero writes, pending/rejected/stale refused, source/vault/baseline drift after approval refused and marked stale, tampered proposals refused, dry run writes nothing, exact non-overwriting backups, atomic-write/fsync/read-only-directory/backup/intent failures leave the source intact with no temp files, post-write verification, apply metadata, no sync_state/Qdrant/vault writes, drift observed by the analyzer and re-ingestion afterwards, mode preservation, partial-transaction recovery without a second write, idempotent re-apply, round-trip guard), post-apply reconciliation (verbatim native `.md`/`.txt` bodies, source frontmatter as metadata, PDF/DOCX bodies unchanged, one-time legacy-contract reprocess, `vault_write` relationship kept with stale outcome reset, unedited outdated note classified `SOURCE_CHANGED`, apply → re-ingest → `IN_SYNC` → rebaseline without conflict, later human edits and source changes handled normally), hybrid retrieval (semantic-only equivalence with `store.search`, eq/any-of/contains/contains-all/boolean/date filters, invalid field/operator/value rejection before embedding, hard filters removing semantically strong results, bounded soft boosts and exact score composition, candidate-pool promotion, deterministic ranking and tie-breaking, provenance and intact metadata, stable JSON, diversity on/off, legacy/missing/malformed payloads, empty and missing collections, limit handling, metadata-only listing and truncation, non-cosine refusal, idempotent explicit index creation, no client creation on import, read-only Qdrant use, MCP `semantic_search` + `hybrid_search`, CLI), and the `main.py` CLI (default extract-only path unchanged, `--index` path indexing + optional Markdown write + incremental state + nonzero exit on errors, `--ai-structure` parser validation and plumbing, existing-vault-note protection, source file never modified, `--write-vault` opt-in/conflict-reporting/custom-destination, `--analyze-vault` zero-writes/JSON-output/source-filter, full propose/approve/reject/list/show lifecycle).
+481 tests cover metadata filters (frontmatter/tag/date extraction, filtered search by source/project/tags/date ranges, local-file payload backfill without re-embedding, MCP filter pass-through), chunking (splitting/reconstruction/ID stability/metadata merging), the vector store (upsert/search/reindex/dimension-mismatch/idempotency/metadata payloads, against an in-memory Qdrant instance and a fake Ollama client — no live services required), the Obsidian vault walker (nested directories, exclusion filtering, no infinite loops), the vault sync orchestrator (first run, unchanged-skip, changed-reindex, error isolation), local-file ingestion (single file, recursive directory, unchanged/changed/no-orphans, unsupported files, one-bad-file-does-not-abort-batch, source metadata), namespaced sync-state persistence (vault/local isolation, legacy-format migration), AI structuring (invocation, structured text reaching the store, provenance metadata, safe fallback on request failure, safe fallback on empty/invalid output, incremental skip/reprocess on source-change/flag-toggle/model-change, directory ingestion with structuring enabled, configurable timeout precedence, failed-attempt retry semantics, ai_structured metadata correctness), managed vault write-back (create/conflict/safe-update/human-edit-detection/skip-on-unchanged/frontmatter-provenance/hash-excludes-frontmatter/already-in-sync rebaseline that never drops non-cortex frontmatter, all against an in-memory fake Obsidian client), the read-only reverse-sync analyzer (all 8 classifications, diff generation and truncation, precedence, zero-writes-to-vault/source/state, multiple-notes-in-one-run, one-invalid-note-does-not-block-others, legacy-state safe classification), durable change proposals (deterministic ID derivation and drift-sensitivity, idempotent regeneration, atomic writes, round-tripping, malformed/unsupported-schema-version safe failure, staleness detection on source/vault/note drift, terminal-decision immutability in both directions, zero writes to source/vault/Qdrant/sync_state on approval or rejection), the apply layer (exact reviewed body into `.md`/`.txt`, source-frontmatter preservation, no Cortex-frontmatter leakage, unsupported types/classifications/AI-structured refused with zero writes, pending/rejected/stale refused, source/vault/baseline drift after approval refused and marked stale, tampered proposals refused, dry run writes nothing, exact non-overwriting backups, atomic-write/fsync/read-only-directory/backup/intent failures leave the source intact with no temp files, post-write verification, apply metadata, no sync_state/Qdrant/vault writes, drift observed by the analyzer and re-ingestion afterwards, mode preservation, partial-transaction recovery without a second write, idempotent re-apply, round-trip guard), post-apply reconciliation (verbatim native `.md`/`.txt` bodies, source frontmatter as metadata, PDF/DOCX bodies unchanged, one-time legacy-contract reprocess, `vault_write` relationship kept with stale outcome reset, unedited outdated note classified `SOURCE_CHANGED`, apply → re-ingest → `IN_SYNC` → rebaseline without conflict, later human edits and source changes handled normally), hybrid retrieval (semantic-only equivalence with `store.search`, eq/any-of/contains/contains-all/boolean/date filters, invalid field/operator/value rejection before embedding, hard filters removing semantically strong results, bounded soft boosts and exact score composition, candidate-pool promotion, deterministic ranking and tie-breaking, provenance and intact metadata, stable JSON, diversity on/off, legacy/missing/malformed payloads, empty and missing collections, limit handling, metadata-only listing and truncation, non-cosine refusal, idempotent explicit index creation, no client creation on import, read-only Qdrant use, MCP `semantic_search` + `hybrid_search`, CLI), the Knowledge Cortex (identity migration and optimistic row versions; diff3 merge incl. adjacency/insertion/fence cases; immutable history, deterministic ids, diff, restore-as-new-revision, graph checks; every sync state including source/vault propagation, proposal-based reverse sync, auto-merge, conflicts and superseding, renames, collisions, ambiguity, tombstones/propagation/restore/purge, unsupported formats, racing human edits, dry-run zero writes, idempotency; crash recovery replay/rollback/backup compensation; temporal as_of/windows/valid time/visibility; synthesis provenance/rejection/staleness/contradictions/determinism/immutability; roles, visibility, grants, actor recording; concurrent-edit merge/conflict and every resolution action incl. never-auto-applied AI suggestions; CLI and MCP tools; path-traversal/symlink/tamper/malformed-state safety), and the `main.py` CLI (default extract-only path unchanged, `--index` path indexing + optional Markdown write + incremental state + nonzero exit on errors, `--ai-structure` parser validation and plumbing, existing-vault-note protection, source file never modified, `--write-vault` opt-in/conflict-reporting/custom-destination, `--analyze-vault` zero-writes/JSON-output/source-filter, full propose/approve/reject/list/show lifecycle).
 
 ## Roadmap
 
@@ -609,15 +809,15 @@ python -m unittest discover -s tests -v
 - [x] Durable change proposals + explicit human approval (`ingest/proposals.py`, `main.py --propose-vault-changes`/`--approve-proposal`/`--reject-proposal`/`--list-proposals`/`--show-proposal`) — deterministic content-derived proposal IDs, atomic JSON storage under `state/proposals/`, mandatory staleness re-verification before approval, immutable terminal decisions. Still makes zero writes to source/Obsidian/Qdrant/sync_state.json, even on approval; applying is a separate explicit step.
 - [x] Apply layer: consume an approved proposal and actually perform the reverse write (`ingest/apply.py`, `main.py --apply-proposal [--dry-run]`) — approved `HUMAN_MODIFIED` proposals only, `.md`/`.txt` sources only, exact reviewed body, full three-authority revalidation before writing, backup + atomic replace + post-write verification, `applied` status with an honest partial-transaction recovery contract. Never writes the vault, Qdrant, or sync_state.json.
 - [x] Post-apply reconciliation — native `.md`/`.txt` bodies round-trip verbatim through ingestion (`ingest/markdown.document_body`; PDF/DOCX unchanged), `vault_write.dest_path` survives re-ingestion with the stale write outcome reset, an unedited-but-outdated note is `SOURCE_CHANGED` rather than `HUMAN_MODIFIED`, and `--write-vault` re-baselines (never rewrites) a note that already equals the generated body, so an applied edit converges to `IN_SYNC` with no false conflict
-- [ ] Full bidirectional sync (vault → source-file reverse sync, automatic conflict merge, rename/delete propagation)
+- [x] Full bidirectional sync (`cortex/sync_engine.py`, `cortex_cli.py sync`) — stable document identity, 15-state machine, source → vault writes, vault → source through the existing proposal/approve/apply workflow, deterministic diff3 auto-merge of non-overlapping edits (overlap = conflict), identity-preserving rename propagation, tombstoned delete propagation with recovery areas/restore/admin-only purge, journaled + recoverable operations. Validated live against the Obsidian MCP server; on that backend rename/delete propagation is opt-in (`OBSIDIAN_ALLOW_MOVES=1`, because Obsidian's move rewrites links in other notes) and fails closed otherwise.
 - [x] Hybrid retrieval combining vectors and metadata (`graph/retrieval.py`, `main.py --search`, MCP `hybrid_search`) — native Qdrant hard filters over the audited payload fields, bounded transparent soft-preference boosts (`final = semantic + min(Σ w·match, 0.10)`), deterministic tie-breaking, bounded candidate pool, optional per-source diversity, metadata-only listing, score breakdown/provenance per result, explicit idempotent `--create-payload-indexes`; `semantic_search`/`store.search` unchanged
 
 ### Phase 4: Cognitive Infrastructure
-- [ ] Knowledge synthesis
-- [ ] Temporal context
-- [ ] Multi-user cortex
-- [ ] Version control for thought evolution
-- [ ] Conflict resolution for concurrent edits
+- [x] Knowledge synthesis (`cortex/synthesis.py`) — 9 synthesis types over visibility-filtered hybrid/temporal evidence, exact per-item provenance (document/revision/point/sha256/score), uncited statements rejected, immutable artifacts with deterministic ids, staleness detection + resynthesis, contradiction records with metadata-only auto-classification, pluggable model (Ollama by default)
+- [x] Temporal context (`cortex/temporal.py`) — transaction time (revisions + append-only heads) kept separate from declared valid time; `as_of`, changed-in-window and `valid_at` retrieval over a derived Qdrant history collection; change log; current retrieval unchanged
+- [x] Multi-user cortex (`cortex/users.py`) — local users with admin/member/viewer roles, private/shared/system visibility, per-document grants, capabilities (read/write/approve/apply/delete/admin) enforced across sync, proposals, conflicts, history, retrieval and synthesis; actors recorded everywhere; default local admin for migrated single-user installs (local trust model, no authentication)
+- [x] Version control for thought evolution (`cortex/versions.py`) — immutable, trigger-enforced revisions with deterministic ids, merge revisions with two parents, history/diff/restore-as-new-revision, graph verification
+- [x] Conflict resolution for concurrent edits (`cortex/conflicts.py`) — optimistic concurrency on expected revision, deterministic merge or explicit conflict record (never last-write-wins), accept-left/right/source/vault, manual, deterministic-merge and explicitly accepted AI-suggestion resolutions, immutable resolved conflicts
 
 ## Philosophy
 
