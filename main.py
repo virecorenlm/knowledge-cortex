@@ -171,6 +171,7 @@ def index_to_qdrant(input_path, out_dir, state_path, store=None, ai_structure=Fa
                 safe_write(entry["markdown"], entry["source_file"], out_dir)
     for result in vault_results:
         label = {"created": "Vault: created", "updated": "Vault: updated",
+                  "rebaselined": "Vault: already in sync, baseline recorded (body not rewritten)",
                   "skipped": "Vault: unchanged, skipped", "conflict": "Vault CONFLICT (not written)",
                   "error": "Vault ERROR"}[result["status"]]
         suffix = f" ({result['reason']})" if result.get("reason") else ""
@@ -329,6 +330,51 @@ def _decision_cli(proposals_dir, proposal_id, action, note, obsidian=None, state
     return 1
 
 
+def apply_proposal_cli(proposal_id, proposals_dir=None, state_path=None, dry_run=False, backups_dir=None,
+                       json_output=False, max_diff_lines=200, obsidian=None):
+    """Entry point for `--apply-proposal`: writes the exact reviewed vault
+    body of an approved HUMAN_MODIFIED proposal back into its .md/.txt
+    source after re-validating the frozen snapshot (see ingest/apply.py).
+    Never writes Obsidian, Qdrant, or sync_state.json. --dry-run runs every
+    check and writes nothing at all (no source, backup, or proposal change).
+    Returns 0 for applied/recovered/already_applied/would_apply, else 1."""
+    import asyncio
+    import json as json_module
+    from ingest.apply import apply_proposal
+    from ingest.obsidian_client import ObsidianClient
+    from ingest.proposals import DEFAULT_PROPOSALS_DIR
+
+    proposals_dir = proposals_dir or DEFAULT_PROPOSALS_DIR
+    client = obsidian or ObsidianClient()
+    result = asyncio.run(apply_proposal(proposals_dir, proposal_id, client, state_path=state_path,
+                                        dry_run=dry_run, backups_dir=backups_dir,
+                                        max_diff_lines=max_diff_lines))
+    if json_output:
+        print(json_module.dumps(result, indent=2))
+        return 0 if result["ok"] else 1
+
+    print(f"Proposal {proposal_id}: {result['status']}" + (" (dry run)" if dry_run else ""))
+    if result.get("reason"):
+        print(f"  {result['reason']}")
+    record = result.get("apply") or {}
+    for label, key in (("source", "source_path"), ("backup", "backup_path"),
+                       ("pre-apply source sha256", "pre_apply_source_sha256"),
+                       ("post-apply source sha256", "post_apply_source_sha256"),
+                       ("frontmatter preserved", "frontmatter_preserved")):
+        value = result.get(key, record.get(key))
+        if value is not None:
+            print(f"  {label}: {value}")
+    for warning in result.get("warnings") or record.get("warnings") or []:
+        print(f"  WARNING: {warning}")
+    if result.get("diff"):
+        print("  diff (source_current -> source_after_apply):")
+        for line in result["diff"]:
+            print(f"    {line}")
+        if result.get("diff_truncated"):
+            print(f"    ... truncated ({result['diff_total_lines']} total diff lines)")
+    return 0 if result["ok"] else 1
+
+
 def list_proposals_cli(proposals_dir=None, json_output=False):
     import json as json_module
     from ingest.proposals import list_proposals, DEFAULT_PROPOSALS_DIR
@@ -388,6 +434,17 @@ def show_proposal_cli(proposal_id, proposals_dir=None, json_output=False):
     if decision.get("status"):
         print(f"Decision:        {decision['status']} at {decision['decided_at']}"
               + (f" -- {decision['note']}" if decision.get("note") else ""))
+    apply_record = proposal.get("apply") or {}
+    if apply_record:
+        print(f"Applied:         {apply_record.get('applied_at')}"
+              + (" (recovered after a partial failure)" if apply_record.get("recovered") else ""))
+        print(f"  backup:                    {apply_record.get('backup_path')}")
+        print(f"  pre_apply_source_sha256:   {apply_record.get('pre_apply_source_sha256')}")
+        print(f"  post_apply_source_sha256:  {apply_record.get('post_apply_source_sha256')}")
+    if proposal.get("apply_intent"):
+        print("Apply intent:    recorded but not completed (rerun --apply-proposal to resolve)")
+    if proposal.get("stale_on_apply"):
+        print(f"Stale on apply:  {'; '.join(proposal['stale_on_apply'].get('reasons') or [])}")
     if proposal.get("diff"):
         print("Diff (cortex_generated -> vault_current):")
         for line in proposal["diff"]:
@@ -457,6 +514,18 @@ def main():
     parser.add_argument("--decision-note", default=None, dest="decision_note",
                          help="Optional human-readable note attached to --approve-proposal or "
                               "--reject-proposal's decision record.")
+    parser.add_argument("--apply-proposal", default=None, dest="apply_proposal",
+                         help="Apply an APPROVED HUMAN_MODIFIED proposal: write its exact reviewed "
+                              "vault body back into the original .md/.txt source, after re-verifying "
+                              "source, vault, and generated baseline against the approved snapshot. "
+                              "Backs up the source first; never writes Obsidian/Qdrant/sync_state.json. "
+                              "See ingest/apply.py.")
+    parser.add_argument("--dry-run", action="store_true", dest="dry_run",
+                         help="With --apply-proposal: run every check and show what would be written, "
+                              "without writing the source, a backup, or the proposal.")
+    parser.add_argument("--backup-dir", type=Path, default=None, dest="backup_dir",
+                         help="With --apply-proposal: directory for pre-apply source backups "
+                              "(default: apply_backups/ next to --proposals-dir, i.e. state/apply_backups/).")
     parser.add_argument("--list-proposals", action="store_true", dest="list_proposals",
                          help="List every proposal under --proposals-dir with its status.")
     parser.add_argument("--show-proposal", default=None, dest="show_proposal",
@@ -472,6 +541,15 @@ def main():
                          help="Path to the shared sync state file (default: sync_state.json)")
     args = parser.parse_args()
 
+    if args.dry_run and not args.apply_proposal:
+        parser.error("--dry-run requires --apply-proposal")
+    if args.backup_dir and not args.apply_proposal:
+        parser.error("--backup-dir requires --apply-proposal")
+
+    if args.apply_proposal:
+        return apply_proposal_cli(args.apply_proposal, proposals_dir=args.proposals_dir, state_path=args.state,
+                                  dry_run=args.dry_run, backups_dir=args.backup_dir,
+                                  json_output=args.json_output, max_diff_lines=args.max_diff_lines)
     if args.propose_vault_changes:
         return propose_vault_changes(args.state, proposals_dir=args.proposals_dir, source=args.source,
                                       max_diff_lines=args.max_diff_lines, json_output=args.json_output)

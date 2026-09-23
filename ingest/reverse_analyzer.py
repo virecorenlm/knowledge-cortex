@@ -47,15 +47,26 @@ secondary condition that isn't already the primary, so nothing is hidden):
                              collapsing it into HUMAN_MODIFIED or IN_SYNC
                              would be a guess, not a detection.
     HUMAN_MODIFIED           Note is valid/cortex-managed and we have an
-                             expected body, but the live body hash differs
-                             from it.
+                             expected body, the live body hash differs
+                             from it, AND differs from the note's own
+                             recorded cortex_generated_sha256 (something
+                             edited it after cortex wrote it). Flag
+                             vault_generated_from_older_source says the
+                             note was generated from a different source
+                             version than the current one.
     SOURCE_MISSING           The source file recorded for this entry no
                              longer exists on disk. (Vault note itself may
                              still be IN_SYNC; this only reports source
                              existence.)
     SOURCE_CHANGED           The source file's current content hash
                              differs from the hash recorded when the
-                             managed note was last generated. Read-only:
+                             managed note was last generated -- either
+                             versus state (not yet re-ingested), or the
+                             note is unmodified since cortex wrote it
+                             (body still hashes to its own
+                             cortex_generated_sha256) but holds an older
+                             generated body than the re-ingested state.
+                             The latter is never HUMAN_MODIFIED. Read-only:
                              this ONLY reports the detection: no
                              reprocessing is triggered.
     IN_SYNC                  Live vault body matches the last
@@ -233,6 +244,31 @@ async def _analyze_one(obsidian, source_file, entry, max_diff_lines):
     expected_body = entry["generated_body"]
     expected_hash = hash_managed_body(expected_body)
     result["expected_generated_sha256"] = expected_hash
+
+    # The note's own recorded cortex_generated_sha256 says whether anyone
+    # touched it since cortex wrote it. If not, a body that differs from the
+    # current generated body is an OLDER cortex output (the source changed
+    # and was re-ingested without --write-vault), never a human edit, so it
+    # must not become an apply-eligible HUMAN_MODIFIED proposal that would
+    # write stale generated text back over the newer source.
+    vault_untouched = result["current_vault_sha256"] == recorded_hash_in_note
+    result["flags"]["vault_generated_from_older_source"] = bool(
+        result["current_source_sha256"] and current_fm.get("cortex_source_sha256")
+        and current_fm["cortex_source_sha256"] != result["current_source_sha256"])
+
+    if result["current_vault_sha256"] != expected_hash and vault_untouched:
+        if result["flags"]["source_missing"]:
+            result["classification"] = "SOURCE_MISSING"
+            result["reason"] = "recorded source file no longer exists on disk"
+            result["proposed_action"] = PROPOSED_ACTIONS["SOURCE_MISSING"]
+            return result
+        result["flags"]["source_changed"] = True
+        result["classification"] = "SOURCE_CHANGED"
+        result["reason"] = ("managed note is unmodified since cortex wrote it but holds an older generated "
+                            "body; the source changed since (run --write-vault to update the note)")
+        result["proposed_action"] = PROPOSED_ACTIONS["SOURCE_CHANGED"]
+        result.update(_build_diff(expected_body, current_body, max_diff_lines))
+        return result
 
     if result["current_vault_sha256"] != expected_hash:
         result["classification"] = "HUMAN_MODIFIED"

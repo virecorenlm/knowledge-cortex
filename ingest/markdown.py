@@ -4,7 +4,44 @@ from datetime import datetime
 FRONTMATTER_RE = re.compile(r"\A---\n(.*?)\n---\n\n?", re.S)
 
 
-def to_markdown(text, source):
+# Document-body contract (what becomes generated_body / the managed note
+# body, before any optional AI structuring):
+#   md:  the source text minus its own leading frontmatter block, verbatim.
+#        That frontmatter is source metadata (it feeds filter metadata; see
+#        ingest/sync.py) and is never part of the body, so the managed note
+#        keeps exactly one frontmatter block (Cortex's) and ingest/apply.py
+#        can keep it byte-for-byte while replacing only the body.
+#   txt: the source text, verbatim. Plain text is already valid Markdown;
+#        bullet-prefixing it would make a reverse-applied body re-ingest
+#        into something different.
+#   pdf/docx/anything else: normalize(), unchanged.
+# A leading UTF-8 BOM is dropped for md/txt. For md/txt,
+# source -> document_body is deterministic, and a body applied back into
+# the source re-ingests to the same body (ingest/apply.py checks this
+# before writing).
+NATIVE_BODY_TYPES = ("md", "txt")
+
+
+def document_body(text, ftype=None):
+    if ftype in NATIVE_BODY_TYPES:
+        text = text[1:] if text.startswith("\ufeff") else text
+        return split_source_frontmatter(text)[1] if ftype == "md" else text
+    return normalize(text)
+
+
+def split_source_frontmatter(text):
+    """(frontmatter_block, body) for a native Markdown source; the block
+    includes its closing '---' line and one following blank line, as matched
+    by FRONTMATTER_RE. ("", text) when there is none."""
+    match = FRONTMATTER_RE.match(text)
+    if not match:
+        return "", text
+    return match.group(0), text[match.end():]
+
+
+def to_markdown(text, source, ftype=None):
+    """Ingestion frontmatter + document_body(text, ftype). Without ftype,
+    every line goes through normalize() (the original behavior)."""
     now = datetime.now().isoformat()
 
     frontmatter = f"""---
@@ -14,7 +51,7 @@ ingested: {now}
 
 """
 
-    return frontmatter + normalize(text)
+    return frontmatter + document_body(text, ftype)
 
 def normalize(text):
     lines = text.splitlines()

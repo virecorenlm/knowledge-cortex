@@ -91,9 +91,32 @@ def _hash_body(body):
     return hashlib.sha256(body.strip().encode("utf-8")).hexdigest()
 
 
-def _build_note(body, metadata):
+CORTEX_FRONTMATTER_KEYS = (
+    "cortex_managed", "cortex_source_id", "cortex_source_path", "cortex_source_sha256",
+    "cortex_generated_sha256", "cortex_last_write", "cortex_prompt_version", "cortex_structure_model",
+)
+
+
+def _build_frontmatter(metadata):
     frontmatter = "\n".join(f"{k}: {v}" for k, v in metadata.items())
-    return f"---\n{frontmatter}\n---\n\n{body.strip()}\n"
+    return f"---\n{frontmatter}\n---\n\n"
+
+
+def _build_note(body, metadata):
+    return f"{_build_frontmatter(metadata)}{body.strip()}\n"
+
+
+def _frontmatter_is_cortex_only(content):
+    """True when the leading frontmatter block is exactly flat 'key: value'
+    lines whose keys are all cortex's own (nothing a rewrite could lose)."""
+    match = FRONTMATTER_RE.match(content)
+    if not match:
+        return False
+    for line in match.group(1).split("\n"):
+        key, sep, _ = line.partition(":")
+        if not sep or key != key.strip() or key not in CORTEX_FRONTMATTER_KEYS:
+            return False
+    return True
 
 
 def source_id_for(abs_source_path):
@@ -135,7 +158,7 @@ async def write_managed_note(obsidian, dest_path, generated_body, metadata):
     are always computed by this function, not passed in.
 
     Returns a dict:
-        {"status": "created" | "updated" | "skipped" | "conflict" | "error",
+        {"status": "created" | "updated" | "rebaselined" | "skipped" | "conflict" | "error",
          "path": dest_path,
          "reason": str | None,
          "generated_sha256": str}   # hash of the body just written/checked,
@@ -145,6 +168,14 @@ async def write_managed_note(obsidian, dest_path, generated_body, metadata):
     genuine unexpected exceptions from the Obsidian client (network/auth
     failures), which the caller is expected to catch and report exactly
     like any other per-file error (see ingest/sync.py's pattern).
+
+    Already-in-sync semantics: if the live body differs from the recorded
+    cortex_generated_sha256 but equals the body being written right now,
+    nothing is overwritten. The note's frontmatter is refreshed to record
+    the new baseline ("rebaselined"; body kept byte-for-byte), and only
+    when that frontmatter consists purely of cortex's own flat keys;
+    otherwise it is reported "skipped" with no write. Any other divergence
+    from the recorded hash is still a conflict.
 
     Missing-note semantics (a previously-created managed note that no
     longer exists at dest_path, e.g. deleted by a human or from outside
@@ -189,6 +220,25 @@ async def write_managed_note(obsidian, dest_path, generated_body, metadata):
 
     recorded_hash = current_fm.get("cortex_generated_sha256")
     live_hash = _hash_body(current_body)
+    if recorded_hash != live_hash and live_hash == generated_hash:
+        # The note was edited since cortex wrote it, but it already holds
+        # exactly what cortex would write now (e.g. a human edit applied
+        # back to the source via --apply-proposal and re-ingested). Nothing
+        # to protect and nothing to write: only record the new baseline so
+        # the NEXT source change isn't a false conflict. The body is kept
+        # verbatim; this is only done when the frontmatter is purely
+        # cortex's own flat keys, so no human frontmatter is ever dropped.
+        if not _frontmatter_is_cortex_only(current["content"]):
+            return {"status": "skipped", "path": dest_path,
+                    "reason": "vault body already matches generated content; frontmatter has non-cortex "
+                              "fields, so the recorded baseline was left unchanged",
+                    "generated_sha256": generated_hash}
+        await obsidian.write_note(dest_path, _build_frontmatter(frontmatter) + current_body)
+        return {"status": "rebaselined", "path": dest_path,
+                "reason": "vault body already matches generated content; recorded baseline updated, "
+                          "body unchanged",
+                "generated_sha256": generated_hash}
+
     if recorded_hash != live_hash:
         return {"status": "conflict", "path": dest_path,
                 "reason": "vault note content changed since knowledge-cortex last wrote it "

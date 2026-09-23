@@ -163,6 +163,16 @@ With `--index`:
 6. One bad file (extraction error, embedding/Qdrant error) is reported in the summary and skipped; its state is not updated (so it's retried next run), and it never aborts the rest of the batch.
 7. Prints a summary and exits non-zero if any file errored, so a script/cron job can detect a partial failure.
 
+**Document-body contract** (`ingest/markdown.document_body`). This is what becomes the cached `generated_body` and the managed note's body, before any optional AI structuring:
+
+| Source type | Body |
+|---|---|
+| `.md` | the source text minus its own leading `---` frontmatter block, **verbatim**: headings, lists, code, and blank lines are untouched |
+| `.txt` | the source text, **verbatim**: plain text is already valid Markdown, and bullet-prefixing it would stop a reverse-applied body from re-ingesting to the same body |
+| `.pdf`, `.docx` | extracted text through `normalize()` (short lines become `- ` list items), unchanged from before |
+
+A leading UTF-8 BOM is dropped for `.md`/`.txt`. A native Markdown source's own frontmatter is **source metadata, not body**. It feeds filter metadata (`project`/`tags`/`date`, which previously never worked for local `.md` files because the frontmatter was bullet-prefixed), and it is kept out of the indexed text and the managed note, so the managed note always has exactly one frontmatter block (Cortex's). `--apply-proposal` keeps it byte-for-byte in the source. For `.md`/`.txt`, source → body is deterministic, and a body applied back into the source re-ingests to that same body. `.md`/`.txt` state entries recorded under the old bulletizing contract carry no `body_contract: 2` marker, so they are reprocessed once on the next `--index` (PDF/DOCX are never forced). The plain extract-only path (`--out` without `--index`) is unchanged and still bulletizes every format.
+
 `ingest.sync.index_local_folder` (the pre-`--index` helper) still exists as a thin backward-compatible wrapper around the new `index_local_path`, for any code still calling it directly.
 
 ## Optional AI structuring (`--ai-structure`)
@@ -229,6 +239,7 @@ cortex_structure_model: <model name if AI-structured, else empty>
 | C | note exists, managed, current body hash matches the hash cortex last recorded | safe update |
 | D | note exists, managed, but current body hash has changed (human edit) since cortex last wrote it | **conflict** — refuse to overwrite |
 | E | generated content is identical to what's already there | skip (no write at all) |
+| F | note was edited since cortex wrote it, but its body already **equals** the content being written (e.g. an applied human edit, re-ingested) | **rebaseline**: no body write; only cortex's frontmatter is refreshed (new `cortex_generated_sha256`, body kept byte-for-byte), so the next genuine source change is a safe update instead of a false conflict. Done only when the frontmatter is purely cortex's own flat keys; otherwise `skipped` with no write. |
 
 **Human edits always win.** Cases B and D never overwrite; they're reported (printed per-entry, e.g. `Vault CONFLICT (not written): <path> (<reason>)`) so you can review and merge manually. There is no automatic conflict resolution in this phase.
 
@@ -257,7 +268,7 @@ python main.py --analyze-vault --max-diff-lines 500    # raise the diff truncati
 
 `--analyze-vault` does not take the `input` positional argument and does not require `--index`; it only reads `sync_state.json` and the live vault.
 
-**This is preparation for a future, still-unbuilt, human-approved reverse sync** — this analyzer only detects and reports divergence; it never applies anything. There is currently no code path anywhere in this project that writes a vault note's content back into the source file.
+**The analyzer only detects and reports divergence; it never applies anything.** The only code path that writes a vault note's content back into a source file is the separate, explicitly-invoked apply layer (`--apply-proposal`, below), which acts only on an approved proposal.
 
 **Authority model** (three independent sources of truth, compared against each other, never merged automatically):
 - the **live vault note** is authority for what currently exists in Obsidian
@@ -272,9 +283,9 @@ python main.py --analyze-vault --max-diff-lines 500    # raise the diff truncati
 | 2 | `UNMANAGED_AT_TARGET` | A note exists at the expected deterministic path but isn't marked cortex-managed. |
 | 3 | `MISSING` | No note exists at the expected path at all. |
 | 4 | `ANALYSIS_INSUFFICIENT_STATE` | The note is valid and cortex-managed, but state has no cached `generated_body` for this source (e.g. pre-dates that field) — genuinely can't say IN_SYNC vs HUMAN_MODIFIED without a guess, so it doesn't guess. |
-| 5 | `HUMAN_MODIFIED` | Live vault body hash differs from the last cortex-generated body hash. |
+| 5 | `HUMAN_MODIFIED` | Live vault body hash differs from the last cortex-generated body hash **and** from the note's own recorded `cortex_generated_sha256`, so something edited it after cortex wrote it. Flag `vault_generated_from_older_source` means the note was generated from a different source version. |
 | 6 | `SOURCE_MISSING` | The recorded source file no longer exists on disk. |
-| 7 | `SOURCE_CHANGED` | The source file's current content hash differs from what was recorded when the managed note was last generated — reported only; **never triggers reprocessing**. |
+| 7 | `SOURCE_CHANGED` | The source file's current content hash differs from what was recorded when the managed note was last generated. Either the source changed but wasn't re-ingested yet, or it was re-ingested without `--write-vault` and the note is still an **unedited older cortex output** (its body still matches its own recorded hash). The latter is never `HUMAN_MODIFIED`, so it can never become an apply-eligible proposal that would write stale generated text back over the newer source. Reported only; **never triggers reprocessing**. |
 | 8 | `IN_SYNC` | Vault body matches the last generated body; source unchanged and present. |
 
 Precedence rationale: provenance problems are checked before any content comparison; among content-comparison outcomes, a human edit in the vault (`HUMAN_MODIFIED`) is surfaced ahead of a source-side change (`SOURCE_CHANGED`/`SOURCE_MISSING`) because it's the more urgent, harder-to-recover-from divergence — but source-side flags are still reported (`flags: {source_changed, source_missing}`) even when `HUMAN_MODIFIED` is the primary classification, so nothing is hidden.
@@ -289,7 +300,7 @@ Precedence rationale: provenance problems are checked before any content compari
 
 ## Durable change proposals + explicit approval (`--propose-vault-changes`)
 
-The analyzer above only prints findings; nothing persists between runs. `--propose-vault-changes` turns each actionable finding into a durable, reviewable **proposal file** that a human can inspect and explicitly approve or reject — still with **zero writes to source files, Obsidian, Qdrant, or `sync_state.json`**, even when a proposal is approved. This is preparation for a future, still-unbuilt "apply" layer; nothing in this phase applies anything.
+The analyzer above only prints findings; nothing persists between runs. `--propose-vault-changes` turns each actionable finding into a durable, reviewable **proposal file** that a human can inspect and explicitly approve or reject — still with **zero writes to source files, Obsidian, Qdrant, or `sync_state.json`**, even when a proposal is approved. Approval alone never changes a source; only the separate `--apply-proposal` step (next section) does.
 
 ```bash
 python main.py --propose-vault-changes                   # analyze + create proposals for actionable divergence
@@ -307,7 +318,7 @@ python main.py --propose-vault-changes --proposals-dir /custom/path  # override 
 
 **Proposal-ID identity contract.** The id is `sha256(canonical_json({source_path, managed_note_path, classification, proposed_action, source_sha256, expected_generated_sha256, live_vault_sha256}))[:16]` — deliberately excluding `created_at`, `status`, `decision`, and the diff text (a rendering of the same fingerprinted facts, not an independent one). This means: regenerating a proposal for an **unchanged** situation reproduces the exact same id (idempotent — `--propose-vault-changes` won't pile up duplicates for a persistent, unresolved divergence), while the id **changes** the moment any material fingerprint changes, which is also what makes staleness detection possible (see below).
 
-**What's stored, and why the exact reviewed content is kept, not just a hash:** each proposal captures the classification, proposed action, fingerprints (`source_sha256`, `expected_generated_sha256`, `live_vault_sha256`), the diff (with truncation info), and the **exact live vault body text reviewed** (`reviewed_live_vault_body`) — not merely its hash. A future apply layer must be able to act on precisely what a human approved, not something regenerated later that might legitimately differ (e.g. if `sync_state.json`'s cached body is later overwritten by a subsequent `--write-vault` run, or the analyzer's own logic changes) — so the full text is captured now, while safety matters more than saving a few KB.
+**What's stored, and why the exact reviewed content is kept, not just a hash:** each proposal captures the classification, proposed action, fingerprints (`source_sha256`, `expected_generated_sha256`, `live_vault_sha256`), the diff (with truncation info), and the **exact live vault body text reviewed** (`reviewed_live_vault_body`) — not merely its hash. The apply layer must act on precisely what a human approved, not something regenerated later that might legitimately differ (e.g. if `sync_state.json`'s cached body is later overwritten by a subsequent `--write-vault` run, or the analyzer's own logic changes) — so the full text is captured now, while safety matters more than saving a few KB.
 
 **Approval semantics — staleness is checked EVERY time, non-negotiably.** `--approve-proposal` re-reads the live source and vault note immediately before approving and re-computes their current fingerprints. If the source no longer exists, its hash has changed, the managed note no longer exists, or its live body hash has changed since the proposal was created, the proposal is marked `stale` and **NOT approved** — the human is told exactly which fingerprint drifted. A stale proposal is never retroactively approvable, even if the drifted condition is later reverted back to match; a fresh proposal (with a freshly-computed, correct id) must be generated instead. Approval only ever writes to the proposal's own JSON file (`status` + `decision` fields) — never source, Obsidian, Qdrant, or `sync_state.json`.
 
@@ -315,7 +326,86 @@ python main.py --propose-vault-changes --proposals-dir /custom/path  # override 
 
 **Terminal decisions.** `approved` and `rejected` are immutable once set — attempting to approve an already-rejected proposal (or vice versa) is refused with a clear error, never silently overwritten. A changed situation is expected to produce a **new** proposal with a new id via another `--propose-vault-changes` run, not a mutated old one.
 
-**No apply layer exists yet.** Approving a proposal changes only its own record; nothing currently reads an `approved` proposal and does anything with it. That is explicitly out of scope for this phase.
+**Approval is not application.** Approving a proposal changes only its own record. Acting on it is a separate, explicit command, `--apply-proposal`, described next.
+
+## Applying an approved proposal (`--apply-proposal`)
+
+`--apply-proposal` is the first reverse write: it takes an **approved `HUMAN_MODIFIED` proposal** and writes the **exact reviewed vault body** stored in that proposal back into the original source file. **This is not bidirectional sync.** Nothing runs automatically. No other classification is applied, and there is no merging, no rename/delete propagation, and no watcher. The vault, Qdrant, and `sync_state.json` are never written.
+
+```bash
+python main.py --apply-proposal <id> --dry-run     # every check, show the source diff, write nothing
+python main.py --apply-proposal <id>               # back up, atomically replace the source, record "applied"
+python main.py --apply-proposal <id> --json        # machine-readable result
+python main.py --apply-proposal <id> --backup-dir /custom/backups --proposals-dir /custom/proposals --state /path/sync_state.json
+```
+
+Exit code is 0 for `applied`, `recovered`, `already_applied`, and `would_apply`/`would_recover` (dry run), and 1 for every refusal or failure.
+
+**Status lifecycle.** `pending → approved → applied`, plus `rejected` and `stale`. Only the apply layer sets `applied`. Approve and reject treat `applied` as terminal, just like `approved`/`rejected`.
+
+| Proposal status | `--apply-proposal` result |
+|---|---|
+| `pending` | refused (`not_approved`) |
+| `rejected` | refused (`rejected`) |
+| `stale` | refused (`stale`), generate a fresh proposal |
+| `approved` | applied if every check below passes |
+| `applied` | `already_applied`, a no-op: the source is not written again |
+
+**Eligibility.** Everything else is refused with zero writes:
+- classification `HUMAN_MODIFIED` with proposed action `review_human_changes`. `MISSING`, `SOURCE_CHANGED`, `SOURCE_MISSING`, `UNMANAGED_AT_TARGET`, `INVALID_MANAGED_NOTE`, `ANALYSIS_INSUFFICIENT_STATE`, and `IN_SYNC` are never applied (`ineligible_classification`).
+- not AI-structured. **This is a deliberate safety constraint, not a missing feature.** With `--ai-structure` the generated body is model output, so source → body is neither deterministic nor invertible. Applying would replace source text with model text, and re-ingestion would re-run the model, so the round trip could never converge.
+- round-trip stable: running the candidate source back through ingestion's own body contract must reproduce the reviewed body. Otherwise the result is `not_round_trip_stable`, e.g. a body that starts with a frontmatter-like block, written into a `.md` source that has no frontmatter, would be read back as source frontmatter.
+- the proposal passes the same internal-consistency validation approval uses (the ID recomputes from its fields, and `reviewed_live_vault_body` hashes to `live_vault_sha256`), and it has an approved decision record.
+- the `--state` path is the proposal's original resolved `state_path`.
+
+**Supported source types:** `.md` and `.txt` only, as a regular, writable, non-symlink, strict UTF-8 file. **Unsupported:** PDF, DOCX, images, binary files, anything without one of those two extensions (`unsupported_source_type`), plus symlinks (`unsupported_source_file`), read-only files (`source_not_writable`), and non-UTF-8 text (`unsupported_source_encoding`). All of these are refused before anything is written.
+
+**Frozen-snapshot rule.** Approval authorizes one exact three-way snapshot, not whatever exists later. Immediately before writing, apply re-reads all three authorities with the same drift check approval uses (`ingest.proposals.detect_drift`):
+1. the source file (presence plus extracted-text hash)
+2. the live managed note (presence plus body hash)
+3. the Cortex generated baseline (`generated_body` under the exact source key in the original `sync_state.json`)
+
+If anything differs from the proposal's fingerprints, nothing is written. The result is `stale`, with the authority that changed. The proposal is marked `stale` (its approved decision is kept for history, and the reasons go in `stale_on_apply`), and a fresh proposal is required. The source bytes that get backed up are hashed again, and compared a final time right before the swap, so a source edited mid-apply is not overwritten.
+
+**What gets written.** The content is always `reviewed_live_vault_body` from the proposal. It is never re-read from the vault, regenerated, rebuilt from the diff, fetched from Qdrant, or re-structured.
+- `.txt`: the reviewed body, verbatim. No frontmatter is ever added.
+- `.md`: if the source has a leading `---` frontmatter block, that block is kept byte-for-byte and the reviewed body replaces everything after it. Without source frontmatter, the source becomes the reviewed body verbatim.
+- Cortex ownership frontmatter (`cortex_managed`, `cortex_source_id`, …) never reaches the source. The reviewed body is captured without it, and a candidate whose body starts with a block of `cortex_*` keys is refused (`cortex_metadata_in_candidate`).
+- A UTF-8 BOM and consistent CRLF line endings in the source are carried over. An empty body is refused (`empty_candidate`), as is a body that no longer hashes to the approved fingerprint after line-ending normalization (`candidate_hash_mismatch`).
+
+**Backup.** Before the source is touched, its exact pre-apply bytes are written to `state/apply_backups/<proposal_id>/<filename>.pre-apply`. The directory sits next to `--proposals-dir`, or wherever `--backup-dir` points. Backups are created with `O_EXCL` and mode `0600`, fsynced, and read back to confirm. An existing backup is never overwritten: the next free name (`.pre-apply.1`, `.2`, …) is used. The backup path is recorded in the result and the proposal. If the backup fails, the source is not written (`backup_failed`).
+
+**Atomic write.**
+1. Build the complete candidate bytes.
+2. Write them to a temp file in the source's own directory (`.<name>.*.cortex-apply.tmp`), flush, and `fsync`.
+3. Copy the original file mode (and owner, where permitted).
+4. Check the source still holds the validated bytes, then `os.replace`, then fsync the parent directory.
+
+Any failure before the replace leaves the original untouched and removes the temp file (`write_failed`).
+
+**Post-write verification.** The source is re-read. Its bytes must equal the candidate, its extracted-text hash must equal the expected post-apply hash, the preserved frontmatter must be intact, and the body after it must hash to the approved `live_vault_sha256`. A mismatch is reported as `verification_failed`, with the backup path for restoring.
+
+**Recorded on success.** `status: applied` plus an `apply` record: `applied_at`, `source_path`, `pre_apply_source_sha256` and `post_apply_source_sha256` (extracted text), the matching `*_bytes_sha256` (raw bytes), `backup_path`, `frontmatter_preserved`, `recovered`, and `warnings`. The fingerprints, reviewed body, and approval decision are never modified.
+
+**Recovery contract for partial transactions.** Replacing the source and updating the proposal JSON cannot be made atomic together, so apply records an `apply_intent` in the proposal (pre-apply and candidate byte hashes, plus the backup path) before replacing the source. If the final "applied" write fails after the source was replaced, the result is `partial_failure` and the proposal stays `approved` with its intent. Rerunning `--apply-proposal` compares the current source bytes against that intent:
+- **equal to the approved candidate:** the write already happened. The application is recorded (`recovered`, `apply.recovered: true`) without writing the source again. If the vault or baseline changed in the meantime, that is recorded under `warnings`, since the source write cannot be undone automatically.
+- **equal to the pre-apply bytes:** the replace never happened. The full, fully-revalidated apply runs again.
+- **anything else:** refused (`manual_review_required`), with the backup path. Nothing is overwritten.
+
+**What apply deliberately does not do.**
+- It does not write the vault. The vault already holds the reviewed content.
+- It does not touch Qdrant (`VectorStore` is never imported).
+- It does not touch `sync_state.json`.
+
+**Post-apply reconciliation (through the normal pipeline, no special cases):**
+1. Right after apply, `--analyze-vault` still reports `HUMAN_MODIFIED`, with `flags: source_changed`: the source changed, and the cached generated body is still the old one.
+2. The next normal `--index` run sees the changed source and re-extracts, re-chunks, and re-embeds it, replacing the old chunks with no orphans. Its new `generated_body` equals the applied vault body, by the round-trip contract. The managed-note relationship survives re-ingestion: `vault_write.dest_path` is kept, while the previous write outcome (which described the old body) is reset to `status: unverified`, `generated_sha256: null`.
+3. `--analyze-vault` now reports `IN_SYNC`, because the live vault body hash equals the new generated body hash.
+4. `--index --write-vault` finds the vault already holds exactly that body, so it re-baselines the note's frontmatter (Case F above) without rewriting the body or reporting a conflict. A further human edit of the vault is `HUMAN_MODIFIED`/conflict again as usual, and a further source change is a normal safe update.
+
+**Remaining limits (why this is not yet bidirectional sync):**
+- Only approved, non-AI-structured `HUMAN_MODIFIED` proposals for `.md`/`.txt` are applied. There is no merging and no rename/delete propagation, and nothing runs automatically.
+- There is no lock. Edits landing between the final source compare and `os.replace`, or vault edits after the drift check, are not covered.
 
 ## Semantic search — CLI
 
@@ -413,7 +503,7 @@ Verify with `hermes mcp test knowledge_cortex`, then `/reload-mcp` in an active 
 python -m unittest discover -s tests -v
 ```
 
-241 tests cover metadata filters (frontmatter/tag/date extraction, filtered search by source/project/tags/date ranges, local-file payload backfill without re-embedding, MCP filter pass-through), chunking (splitting/reconstruction/ID stability/metadata merging), the vector store (upsert/search/reindex/dimension-mismatch/idempotency/metadata payloads, against an in-memory Qdrant instance and a fake Ollama client — no live services required), the Obsidian vault walker (nested directories, exclusion filtering, no infinite loops), the vault sync orchestrator (first run, unchanged-skip, changed-reindex, error isolation), local-file ingestion (single file, recursive directory, unchanged/changed/no-orphans, unsupported files, one-bad-file-does-not-abort-batch, source metadata), namespaced sync-state persistence (vault/local isolation, legacy-format migration), AI structuring (invocation, structured text reaching the store, provenance metadata, safe fallback on request failure, safe fallback on empty/invalid output, incremental skip/reprocess on source-change/flag-toggle/model-change, directory ingestion with structuring enabled, configurable timeout precedence, failed-attempt retry semantics, ai_structured metadata correctness), managed vault write-back (create/conflict/safe-update/human-edit-detection/skip-on-unchanged/frontmatter-provenance/hash-excludes-frontmatter, all against an in-memory fake Obsidian client), the read-only reverse-sync analyzer (all 8 classifications, diff generation and truncation, precedence, zero-writes-to-vault/source/state, multiple-notes-in-one-run, one-invalid-note-does-not-block-others, legacy-state safe classification), durable change proposals (deterministic ID derivation and drift-sensitivity, idempotent regeneration, atomic writes, round-tripping, malformed/unsupported-schema-version safe failure, staleness detection on source/vault/note drift, terminal-decision immutability in both directions, zero writes to source/vault/Qdrant/sync_state on approval or rejection), and the `main.py` CLI (default extract-only path unchanged, `--index` path indexing + optional Markdown write + incremental state + nonzero exit on errors, `--ai-structure` parser validation and plumbing, existing-vault-note protection, source file never modified, `--write-vault` opt-in/conflict-reporting/custom-destination, `--analyze-vault` zero-writes/JSON-output/source-filter, full propose/approve/reject/list/show lifecycle).
+325 tests cover metadata filters (frontmatter/tag/date extraction, filtered search by source/project/tags/date ranges, local-file payload backfill without re-embedding, MCP filter pass-through), chunking (splitting/reconstruction/ID stability/metadata merging), the vector store (upsert/search/reindex/dimension-mismatch/idempotency/metadata payloads, against an in-memory Qdrant instance and a fake Ollama client — no live services required), the Obsidian vault walker (nested directories, exclusion filtering, no infinite loops), the vault sync orchestrator (first run, unchanged-skip, changed-reindex, error isolation), local-file ingestion (single file, recursive directory, unchanged/changed/no-orphans, unsupported files, one-bad-file-does-not-abort-batch, source metadata), namespaced sync-state persistence (vault/local isolation, legacy-format migration), AI structuring (invocation, structured text reaching the store, provenance metadata, safe fallback on request failure, safe fallback on empty/invalid output, incremental skip/reprocess on source-change/flag-toggle/model-change, directory ingestion with structuring enabled, configurable timeout precedence, failed-attempt retry semantics, ai_structured metadata correctness), managed vault write-back (create/conflict/safe-update/human-edit-detection/skip-on-unchanged/frontmatter-provenance/hash-excludes-frontmatter/already-in-sync rebaseline that never drops non-cortex frontmatter, all against an in-memory fake Obsidian client), the read-only reverse-sync analyzer (all 8 classifications, diff generation and truncation, precedence, zero-writes-to-vault/source/state, multiple-notes-in-one-run, one-invalid-note-does-not-block-others, legacy-state safe classification), durable change proposals (deterministic ID derivation and drift-sensitivity, idempotent regeneration, atomic writes, round-tripping, malformed/unsupported-schema-version safe failure, staleness detection on source/vault/note drift, terminal-decision immutability in both directions, zero writes to source/vault/Qdrant/sync_state on approval or rejection), the apply layer (exact reviewed body into `.md`/`.txt`, source-frontmatter preservation, no Cortex-frontmatter leakage, unsupported types/classifications/AI-structured refused with zero writes, pending/rejected/stale refused, source/vault/baseline drift after approval refused and marked stale, tampered proposals refused, dry run writes nothing, exact non-overwriting backups, atomic-write/fsync/read-only-directory/backup/intent failures leave the source intact with no temp files, post-write verification, apply metadata, no sync_state/Qdrant/vault writes, drift observed by the analyzer and re-ingestion afterwards, mode preservation, partial-transaction recovery without a second write, idempotent re-apply, round-trip guard), post-apply reconciliation (verbatim native `.md`/`.txt` bodies, source frontmatter as metadata, PDF/DOCX bodies unchanged, one-time legacy-contract reprocess, `vault_write` relationship kept with stale outcome reset, unedited outdated note classified `SOURCE_CHANGED`, apply → re-ingest → `IN_SYNC` → rebaseline without conflict, later human edits and source changes handled normally), and the `main.py` CLI (default extract-only path unchanged, `--index` path indexing + optional Markdown write + incremental state + nonzero exit on errors, `--ai-structure` parser validation and plumbing, existing-vault-note protection, source file never modified, `--write-vault` opt-in/conflict-reporting/custom-destination, `--analyze-vault` zero-writes/JSON-output/source-filter, full propose/approve/reject/list/show lifecycle).
 
 ## Roadmap
 
@@ -436,8 +526,9 @@ python -m unittest discover -s tests -v
 - [x] AI-powered structuring (frontmatter, tags, metadata) — `ingest/ai_struct.py`, wired into local ingestion via `main.py --index --ai-structure`; opt-in, fails safe to raw Markdown, configurable timeout (`AI_STRUCTURE_TIMEOUT_SECONDS`, default 300s), and failed attempts are automatically retried on the next run rather than getting stuck on the raw fallback permanently.
 - [x] Managed, conflict-safe one-way write-back into a dedicated vault subtree (`ingest/vault_writer.py`, `main.py --index --write-vault`) — never overwrites a note it can't prove it owns and last wrote unmodified; human edits always win. Still one-directional only.
 - [x] Read-only reverse-sync analyzer (`ingest/reverse_analyzer.py`, `main.py --analyze-vault`) — classifies every managed note (IN_SYNC/HUMAN_MODIFIED/MISSING/UNMANAGED_AT_TARGET/SOURCE_CHANGED/SOURCE_MISSING/INVALID_MANAGED_NOTE/ANALYSIS_INSUFFICIENT_STATE) with a diff and proposed action; makes zero writes anywhere. Preparation for, not implementation of, bidirectional sync.
-- [x] Durable change proposals + explicit human approval (`ingest/proposals.py`, `main.py --propose-vault-changes`/`--approve-proposal`/`--reject-proposal`/`--list-proposals`/`--show-proposal`) — deterministic content-derived proposal IDs, atomic JSON storage under `state/proposals/`, mandatory staleness re-verification before approval, immutable terminal decisions. Still makes zero writes to source/Obsidian/Qdrant/sync_state.json, even on approval. No apply layer yet.
-- [ ] Apply layer: consume an approved proposal and actually perform the reverse write (source-file update or similar) — the only remaining piece before real bidirectional sync
+- [x] Durable change proposals + explicit human approval (`ingest/proposals.py`, `main.py --propose-vault-changes`/`--approve-proposal`/`--reject-proposal`/`--list-proposals`/`--show-proposal`) — deterministic content-derived proposal IDs, atomic JSON storage under `state/proposals/`, mandatory staleness re-verification before approval, immutable terminal decisions. Still makes zero writes to source/Obsidian/Qdrant/sync_state.json, even on approval; applying is a separate explicit step.
+- [x] Apply layer: consume an approved proposal and actually perform the reverse write (`ingest/apply.py`, `main.py --apply-proposal [--dry-run]`) — approved `HUMAN_MODIFIED` proposals only, `.md`/`.txt` sources only, exact reviewed body, full three-authority revalidation before writing, backup + atomic replace + post-write verification, `applied` status with an honest partial-transaction recovery contract. Never writes the vault, Qdrant, or sync_state.json.
+- [x] Post-apply reconciliation — native `.md`/`.txt` bodies round-trip verbatim through ingestion (`ingest/markdown.document_body`; PDF/DOCX unchanged), `vault_write.dest_path` survives re-ingestion with the stale write outcome reset, an unedited-but-outdated note is `SOURCE_CHANGED` rather than `HUMAN_MODIFIED`, and `--write-vault` re-baselines (never rewrites) a note that already equals the generated body, so an applied edit converges to `IN_SYNC` with no false conflict
 - [ ] Full bidirectional sync (vault → source-file reverse sync, automatic conflict merge, rename/delete propagation)
 - [ ] Hybrid retrieval combining vectors and metadata
 

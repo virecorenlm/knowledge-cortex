@@ -12,6 +12,14 @@ import hashlib
 
 from ingest.metadata import extract_filter_metadata
 
+# Version of ingest.markdown.document_body's contract for native md/txt
+# sources. 1 (implicit, absent from state) = every line bullet-prefixed by
+# normalize(); 2 = verbatim body (md minus its own frontmatter). An md/txt
+# entry recorded under another version is reprocessed once so its cached
+# generated_body follows the current contract. pdf/docx output is
+# unchanged, so they are never forced to reprocess by this.
+BODY_CONTRACT_VERSION = 2
+
 
 async def sync_vault_to_index(obsidian, store, root="", exclude_substrings=(), state=None, max_chars=1200):
     """Index every markdown note under root into store.
@@ -112,7 +120,7 @@ def index_local_path(store, path, state=None, max_chars=1200, markdown_prefix="l
     from pathlib import Path
     from ingest.detect import detect_file_type
     from ingest.extract import extract_text
-    from ingest.markdown import to_markdown, split_frontmatter
+    from ingest.markdown import NATIVE_BODY_TYPES, to_markdown, split_frontmatter
     from utils.fs import iter_files
 
     if structure_fn is None:
@@ -152,6 +160,7 @@ def index_local_path(store, path, state=None, max_chars=1200, markdown_prefix="l
             prior_succeeded = False
             prior_prompt_version = None
             prior_has_cached_body = False
+            prior_body_contract = None
         else:
             prior_digest = prior.get("source_sha256")
             if "ai_structure_requested" in prior:
@@ -177,6 +186,8 @@ def index_local_path(store, path, state=None, max_chars=1200, markdown_prefix="l
             # above -- not a special-cased skip condition, just another
             # instance of the same "prior state is insufficient" pattern.
             prior_has_cached_body = "generated_body" in prior
+            prior_body_contract = prior.get("body_contract")
+        body_contract_ok = ftype not in NATIVE_BODY_TYPES or prior_body_contract == BODY_CONTRACT_VERSION
 
         # Skip only when: the source content is unchanged, the ai_structure
         # on/off setting matches the last run, the previous attempt actually
@@ -190,8 +201,9 @@ def index_local_path(store, path, state=None, max_chars=1200, markdown_prefix="l
         markdown_path = f"{markdown_prefix}/{Path(file).name}"
         if (prior_digest == source_digest and prior_requested == bool(ai_structure)
                 and (not ai_structure or (prior_succeeded and prior_prompt_version == PROMPT_VERSION))
-                and prior_has_cached_body):
-            filter_metadata = _local_filter_metadata(prior["generated_body"], file, project)
+                and prior_has_cached_body and body_contract_ok):
+            filter_metadata = _local_filter_metadata(
+                _metadata_text(text, ftype, prior["generated_body"]), file, project)
             if prior.get("filter_metadata") != filter_metadata:
                 try:
                     store.set_metadata(markdown_path, filter_metadata)
@@ -204,7 +216,7 @@ def index_local_path(store, path, state=None, max_chars=1200, markdown_prefix="l
             continue
 
         try:
-            md = to_markdown(text, source=abs_path)
+            md = to_markdown(text, source=abs_path, ftype=ftype)
             structure_reason = None
             structured_ok = False
             if ai_structure:
@@ -233,7 +245,7 @@ def index_local_path(store, path, state=None, max_chars=1200, markdown_prefix="l
             # frontmatter -- this only affects what a future write-vault
             # stage receives as the note body.
             _, document_body = split_frontmatter(indexed_text)
-            filter_metadata = _local_filter_metadata(document_body, file, project)
+            filter_metadata = _local_filter_metadata(_metadata_text(text, ftype, document_body), file, project)
             metadata = {
                 **filter_metadata,
                 "source_file": abs_path,
@@ -260,7 +272,7 @@ def index_local_path(store, path, state=None, max_chars=1200, markdown_prefix="l
             report["errors"].append({"path": abs_path, "error": str(exc)})
             continue
 
-        state[abs_path] = {
+        new_entry = {
             "source_sha256": source_digest,
             "ai_structure_requested": bool(ai_structure),
             "ai_structure_succeeded": bool(ai_structure and structured_ok),
@@ -273,7 +285,12 @@ def index_local_path(store, path, state=None, max_chars=1200, markdown_prefix="l
             # above for why its absence forces one reprocess.
             "generated_body": document_body,
             "filter_metadata": filter_metadata,
+            "body_contract": BODY_CONTRACT_VERSION,
         }
+        preserved_vault_write = _preserved_vault_write(prior)
+        if preserved_vault_write:
+            new_entry["vault_write"] = preserved_vault_write
+        state[abs_path] = new_entry
         report["indexed"].append({
             "source_file": abs_path, "markdown_path": markdown_path,
             "chunk_count": len(chunks), "markdown": indexed_text,
@@ -283,6 +300,33 @@ def index_local_path(store, path, state=None, max_chars=1200, markdown_prefix="l
             "structure_reason": structure_reason,
         })
     return report, state
+
+
+def _preserved_vault_write(prior):
+    """Carry the managed-note relationship (dest_path) across a reprocess,
+    so the analyzer and --write-vault can still find the note. The previous
+    write outcome described the OLD generated body, so it is not carried
+    over: status becomes "unverified" and generated_sha256 None until the
+    next --write-vault (or the analyzer, from the live note) establishes the
+    real state."""
+    vault_write = prior.get("vault_write") if isinstance(prior, dict) else None
+    if not isinstance(vault_write, dict):
+        return None
+    dest_path = vault_write.get("dest_path")
+    if not isinstance(dest_path, str) or not dest_path:
+        return None
+    return {"dest_path": dest_path, "status": "unverified", "generated_sha256": None}
+
+
+def _metadata_text(text, ftype, document_body):
+    """Text filter metadata is computed from: for md, the source's own
+    frontmatter block (not part of the body, see ingest.markdown) followed
+    by the body; otherwise the body alone."""
+    if ftype != "md":
+        return document_body
+    from ingest.markdown import split_source_frontmatter
+    frontmatter, _ = split_source_frontmatter(text[1:] if text.startswith("\ufeff") else text)
+    return frontmatter + document_body
 
 
 def _local_filter_metadata(document_body, file, project):

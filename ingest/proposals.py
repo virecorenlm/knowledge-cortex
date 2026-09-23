@@ -1,7 +1,10 @@
-"""Durable, metadata-only review proposals. No apply layer exists.
+"""Durable, metadata-only review proposals.
 
 Only proposal JSON files are written. Source files, live Obsidian notes,
-Qdrant, and sync state are never written by this module.
+Qdrant, and sync state are never written by this module. The separate,
+explicitly-invoked apply layer (ingest/apply.py) is the only code that
+acts on an approved proposal, and only for approved HUMAN_MODIFIED
+proposals against .md/.txt sources.
 
 Identity: sha256(canonical JSON of resolved state_path, exact source_path,
 managed_note_path, classification, proposed_action, source_exists, and the
@@ -30,12 +33,14 @@ SOURCE_CHANGED and investigation/source-missing findings are diagnostic:
 approving them does NOT authorize newly regenerated content. No proposal
 here supplies a generic, executable mutation plan.
 
-Approved/rejected decisions are terminal; stale cannot later be approved.
+Approved/rejected/applied are terminal for approve/reject; stale cannot
+later be approved. Only ingest/apply.py moves approved -> applied (or
+approved -> stale when revalidation before a write finds drift).
 Rejection does not require live facts to match. Local JSON consistency is
 not a signature/authentication system; coordinated edits can forge records.
 There is no distributed lock, compare-and-swap, or atomic cross-authority
-snapshot; a future apply layer must revalidate everything and define its own
-format/ownership/authorization policy before making any writes.
+snapshot; ingest/apply.py revalidates everything (detect_drift) again
+immediately before writing and defines its own format/eligibility policy.
 """
 
 import hashlib
@@ -57,6 +62,11 @@ DEFAULT_STATE_PATH = Path(__file__).resolve().parent.parent / "sync_state.json"
 # anything meaningful without guessing (ANALYSIS_INSUFFICIENT_STATE,
 # ERROR).
 NO_PROPOSAL_CLASSIFICATIONS = ("IN_SYNC", "ANALYSIS_INSUFFICIENT_STATE", "ERROR")
+
+# pending -> approved -> applied (ingest/apply.py); pending -> rejected;
+# pending/approved -> stale. "applied" is only ever set by the apply layer.
+STATUSES = ("pending", "approved", "rejected", "stale", "applied")
+TERMINAL_STATUSES = ("approved", "rejected", "applied")
 
 
 def _canonical_json(obj):
@@ -319,7 +329,7 @@ def _validate_proposal_internal_consistency(proposal):
     if not isinstance(decision, dict) or (proposal.get("status") == "pending" and
             (decision.get("status") is not None or decision.get("decided_at") is not None)):
         problems.append("decision metadata is inconsistent with status")
-    if proposal.get("status") not in ("pending", "approved", "rejected", "stale"):
+    if proposal.get("status") not in STATUSES:
         problems.append("status is not a recognized value")
     return problems
 
@@ -387,7 +397,7 @@ async def approve_proposal(proposals_dir, proposal_id, obsidian, note=None, stat
     if proposal is None:
         return {"ok": False, "status": None, "reason": error}
 
-    if proposal["status"] in ("approved", "rejected"):
+    if proposal["status"] in TERMINAL_STATUSES:
         # Terminal decisions are immutable -- see module docstring.
         return {"ok": False, "status": proposal["status"],
                 "reason": f"proposal is already {proposal['status']}; decisions are terminal, "
@@ -414,6 +424,30 @@ async def approve_proposal(proposals_dir, proposal_id, obsidian, note=None, stat
     if str(state_path) != proposal.get("state_path"):
         return {"ok": False, "status": proposal["status"],
                 "reason": "approval state path differs from the proposal's original state_path"}
+    drift_reasons = await detect_drift(proposal, obsidian, state_path)
+
+    if drift_reasons:
+        proposal["status"] = "stale"
+        proposal["decision"] = {
+            "status": None, "decided_at": None,
+            "note": "auto-marked stale on approval attempt: " + "; ".join(drift_reasons),
+        }
+        _atomic_write_json(_proposal_path(proposals_dir, proposal_id), proposal)
+        return {"ok": False, "status": "stale", "reason": "; ".join(drift_reasons)}
+
+    proposal["status"] = "approved"
+    proposal["decision"] = {"status": "approved", "decided_at": datetime.now().isoformat(), "note": note}
+    _atomic_write_json(_proposal_path(proposals_dir, proposal_id), proposal)
+    return {"ok": True, "status": "approved", "reason": None}
+
+
+async def detect_drift(proposal, obsidian, state_path):
+    """Compare a proposal's frozen fingerprints against all three CURRENT
+    authorities (source file, live managed note, and the cached generated
+    baseline in the ORIGINAL state file). Read-only. Returns a list of
+    human-readable drift reasons; empty means the frozen snapshot still
+    matches. Shared by approval and ingest.apply so both enforce the
+    identical staleness contract."""
     current = await _current_fingerprints(proposal["source_path"], proposal["managed_note_path"], obsidian)
     fp = proposal["fingerprints"]
     drift_reasons = []
@@ -458,19 +492,7 @@ async def approve_proposal(proposals_dir, proposal_id, obsidian, note=None, stat
                 f"Cortex generated baseline changed (was {fp['expected_generated_sha256']!r}, "
                 f"now {current_baseline_hash!r})")
 
-    if drift_reasons:
-        proposal["status"] = "stale"
-        proposal["decision"] = {
-            "status": None, "decided_at": None,
-            "note": "auto-marked stale on approval attempt: " + "; ".join(drift_reasons),
-        }
-        _atomic_write_json(_proposal_path(proposals_dir, proposal_id), proposal)
-        return {"ok": False, "status": "stale", "reason": "; ".join(drift_reasons)}
-
-    proposal["status"] = "approved"
-    proposal["decision"] = {"status": "approved", "decided_at": datetime.now().isoformat(), "note": note}
-    _atomic_write_json(_proposal_path(proposals_dir, proposal_id), proposal)
-    return {"ok": True, "status": "approved", "reason": None}
+    return drift_reasons
 
 
 def reject_proposal(proposals_dir, proposal_id, note=None):
@@ -485,7 +507,7 @@ def reject_proposal(proposals_dir, proposal_id, note=None):
     if proposal is None:
         return {"ok": False, "status": None, "reason": error}
 
-    if proposal["status"] in ("approved", "rejected"):
+    if proposal["status"] in TERMINAL_STATUSES:
         return {"ok": False, "status": proposal["status"],
                 "reason": f"proposal is already {proposal['status']}; decisions are terminal"}
 
