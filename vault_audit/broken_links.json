@@ -1,0 +1,93 @@
+{
+  "ambiguous_links": [],
+  "broken_links": [
+    {
+      "embedded": false,
+      "link_style": "wikilink",
+      "link_text": "[[VireOS v1.0]]",
+      "matches": [],
+      "source_note": "_____chatgpt_vire/obsidian-memory-substrate-knowledge-graph-plan.md",
+      "target": "VireOS v1.0"
+    },
+    {
+      "embedded": false,
+      "link_style": "wikilink",
+      "link_text": "[[Hailo 8 Integration]]",
+      "matches": [],
+      "source_note": "_____chatgpt_vire/obsidian-memory-substrate-knowledge-graph-plan.md",
+      "target": "Hailo 8 Integration"
+    },
+    {
+      "embedded": false,
+      "link_style": "wikilink",
+      "link_text": "[[Finish memory schema]]",
+      "matches": [],
+      "source_note": "_____chatgpt_vire/obsidian-memory-substrate-knowledge-graph-plan.md",
+      "target": "Finish memory schema"
+    },
+    {
+      "embedded": false,
+      "link_style": "wikilink",
+      "link_text": "[[workflows.workflow]]",
+      "matches": [],
+      "source_note": "__tma/Replit nix config with workflows - 2025-11-23.md",
+      "target": "workflows.workflow"
+    },
+    {
+      "embedded": false,
+      "link_style": "wikilink",
+      "link_text": "[[workflows.workflow.tasks]]",
+      "matches": [],
+      "source_note": "__tma/Replit nix config with workflows - 2025-11-23.md",
+      "target": "workflows.workflow.tasks"
+    },
+    {
+      "embedded": false,
+      "link_style": "wikilink",
+      "link_text": "[[workflows.workflow]]",
+      "matches": [],
+      "source_note": "__tma/Replit nix config with workflows - 2025-11-23.md",
+      "target": "workflows.workflow"
+    },
+    {
+      "embedded": false,
+      "link_style": "wikilink",
+      "link_text": "[[workflows.workflow.tasks]]",
+      "matches": [],
+      "source_note": "__tma/Replit nix config with workflows - 2025-11-23.md",
+      "target": "workflows.workflow.tasks"
+    },
+    {
+      "embedded": false,
+      "link_style": "markdown",
+      "link_text": "[INSTALL.md](INSTALL.md)",
+      "matches": [],
+      "source_note": "termux_files2/ubuntu-fs/usr/share/doc/libglib2.0-0t64/README.md",
+      "target": "INSTALL.md"
+    },
+    {
+      "embedded": false,
+      "link_style": "markdown",
+      "link_text": "[separate and more in-depth documentation](./docs/win32-build.md)",
+      "matches": [],
+      "source_note": "termux_files2/ubuntu-fs/usr/share/doc/libglib2.0-0t64/README.md",
+      "target": "./docs/win32-build.md"
+    },
+    {
+      "embedded": false,
+      "link_style": "markdown",
+      "link_text": "[SECURITY.md](SECURITY.md)",
+      "matches": [],
+      "source_note": "termux_files2/ubuntu-fs/usr/share/doc/libglib2.0-0t64/README.md",
+      "target": "SECURITY.md"
+    },
+    {
+      "embedded": false,
+      "link_style": "markdown",
+      "link_text": "[contribution guide](./CONTRIBUTING.md)",
+      "matches": [],
+      "source_note": "termux_files2/ubuntu-fs/usr/share/doc/libglib2.0-0t64/README.md",
+      "target": "./CONTRIBUTING.md"
+    }
+  ]
+}
