@@ -454,6 +454,85 @@ How each field is derived at ingest time (`ingest/metadata.py`):
 - **Vault notes** are skipped as unchanged, so run `python sync_cli.py --full` (or MCP `sync_vault(full=true)`) once.
 - **Local files** backfill automatically on the next `--index` run. Their metadata is recomputed from the cached `generated_body` and written onto the existing points with `set_payload`. This skips re-extraction, AI structuring and re-embedding, and is reported as `Filter metadata updated (no re-embedding)`. The same path applies when a later run passes a different `--project`.
 
+## Hybrid retrieval (semantic + metadata)
+
+`graph/retrieval.py` layers structured metadata onto the existing Qdrant collection and embedding model. It adds **hard filters** (native Qdrant filters, so a non-matching chunk can never appear), **soft preferences** (a bounded, transparent rank boost), deterministic ranking, optional source diversity, and a score breakdown with provenance for every result. There is no second search engine: `VectorStore` still does all Qdrant/Ollama access, and the retrieval module only owns policy. It is read-only, and `store.search` / MCP `semantic_search` are unchanged.
+
+```python
+from graph.store import VectorStore
+from graph.retrieval import hybrid_search
+
+response = hybrid_search(
+    VectorStore(), "how do qdrant payload indexes work?", limit=10,
+    filters={"project": "knowledge-cortex", "tags": {"contains_any": ["qdrant", "architecture"]}},
+    prefer={"tags": ["architecture"], "source": "obsidian"},
+    max_per_source=2,
+    instruct="Given a web search query, retrieve relevant passages that answer the query",
+)
+```
+
+```bash
+python main.py --search "qdrant snapshots"
+python main.py --search "qdrant snapshots" --filter-project knowledge-cortex --json
+python main.py --search "architecture decisions" --tag architecture --prefer-project knowledge-cortex
+python main.py --search "retrieval" --filter '{"doc_date": {"gte": "2024-01-01"}}' --prefer '{"tags": {"value": "qdrant", "weight": 0.1}}'
+python main.py --search "" --filter '{"source_file": "/path/to/doc.md"}' --limit 50   # metadata-only listing
+python main.py --search "qdrant" --max-per-source 1 --timings
+python main.py --create-payload-indexes     # explicit, idempotent index setup
+```
+
+`--tag` and `--filter-project`/`--filter-source`/`--prefer-project`/`--prefer-tag` are shortcuts. They merge with `--filter`/`--prefer` JSON, and naming the same field twice is an error. Repeated `--tag` means the chunk must carry all of them. Every `--search` option other than `--search` itself is rejected without `--search`.
+
+**Metadata field contract.** This is the real payload `ingest/sync.py` writes through `VectorStore.upsert_chunks`, audited field by field. The live Qdrant server currently holds only three benchmark collections from an older tool, whose legacy payload (`source_path`, `model`) matches none of these fields. They are left untouched, and retrieval degrades safely on them: their provenance falls back to `source_path`, and filters simply don't match.
+
+| Field | Type | Present on | Hard-filter forms | Payload index |
+|---|---|---|---|---|
+| `source` | keyword | every chunk: `obsidian` or `local_ingest` | `"x"`, `["x","y"]`, `{"eq"}`, `{"in"}` | yes (write path) |
+| `project` | keyword or null | every chunk with filter metadata | same as `source` | yes (write path) |
+| `tags` | keyword list, normalized; nested tags also store their parents | every chunk with filter metadata | `"a"` (contains), `["a","b"]` / `{"contains_any"}`, `{"contains_all"}` | yes (write path) |
+| `path` | keyword (vault path, or `local_ingest/<file name>`) | every chunk | same as `source` | yes (write path) |
+| `source_file` | keyword (absolute path) | `local_ingest` chunks only | same as `source` | `--create-payload-indexes` |
+| `ai_structured` | bool | `local_ingest` chunks only; **missing counts as `false`** (vault notes are never AI-structured) | `true` / `false` | `--create-payload-indexes` |
+| `doc_date` | RFC 3339 UTC or null | every chunk with filter metadata | `{"gte"/"gt"/"lte"/"lt": ISO date}`; a date-only upper bound covers that whole day | yes (write path) |
+
+Tags are normalized like ingestion (lowercase, `#` optional). A list shorthand always means any-of. Unknown fields, unknown operators, malformed values, and `ai_structured: "false"` (a string) raise `ValueError` before anything is embedded. **Deliberately unsupported:** `source_type` (no file-type field is stored; adding one needs a payload migration/reindex) and path prefixes (Qdrant has no native keyword-prefix match; the vault top-level folder is already `project`). `text`, `sha256`, `chunk_index`, `embedding_model`, `markdown_path`, `source_sha256`, `structure_model` and `structured_sha256` are returned in `metadata` but are not filterable.
+
+**Payload indexes.** Indexes for `path`/`source`/`project`/`tags`/`doc_date` are still created on the write path when a collection is created or written. `python main.py --create-payload-indexes` (`VectorStore.ensure_retrieval_indexes()`) explicitly adds any that are missing, plus `source_file` and `ai_structured`, on an existing collection. It reports created vs. already-present, never creates a collection, and never runs on import or search.
+
+**Soft preferences and the score formula.** Preferences use the same fields and value forms (a range object for `doc_date`), optionally as `{"value": ..., "weight": w}`. They never exclude anything. All tuning values live in one place, `graph.retrieval.RankingConfig`:
+
+```
+semantic_score = Qdrant cosine similarity                     (None in metadata-only mode)
+match_p        = 1 or 0 per preference; for tags, the fraction of preferred tags the chunk carries
+contribution_p = weight_p × match_p     weight_p default 0.05, clamped to [0, 0.10]
+metadata_boost = min(Σ contribution_p, 0.10)
+final_score    = semantic_score + metadata_boost               (metadata-only: metadata_boost)
+order          = final ↓, semantic ↓, source identity ↑, chunk_index ↑, point id ↑
+```
+
+A preferred chunk can overtake another **only if that chunk's semantic score is at most 0.10 higher**. In the live integration with `qwen3-embedding:4b`, a related passage scored 0.06 below the best one: a 0.05 project preference left it second, and a 0.10 preference moved it first. An off-topic chunk 0.59 below never moved. Preferences require a Cosine collection (checked at query time), since the bound assumes cosine scores.
+
+**Candidate pool.** With no preferences and no diversity cap, exactly `limit` points are requested, identical to `store.search`. Otherwise the pool is `min(max(limit × 4, 20), 200)`, never below `limit`. That lets a preferred chunk just outside the top `limit` be promoted without ever scanning the collection. A preferred chunk ranked below the pool cannot rise, which is the documented trade-off.
+
+**Metadata-only retrieval.** An empty query lists chunks matching the hard filters with Qdrant's filtered scroll, without embedding. At least one hard filter is required, and at most 1000 matches are considered (in point-id order). Results are ranked by boost, then source identity and `chunk_index`, and `truncated: true` is reported if more matched.
+
+**Diversity.** `max_per_source=N` (off by default) caps chunks per logical source (`source_file`, else `path`) after ranking. Leave it off for deep retrieval from one document.
+
+**Result schema.** The response object has `query`, `mode` (`semantic`/`hybrid`/`metadata_only`), `limit`, `candidate_limit`, normalized `filters` and `prefer`, `max_per_source`, `ranking` (the config in force), `collection`, `truncated`, and `results`. `timings_ms` is added only when timings are requested, so JSON output stays byte-stable. Each result has:
+
+```json
+{"rank": 1, "id": "…", "text": "…", "source": "obsidian", "path": "KC/b.md", "source_file": null,
+ "chunk_index": 0, "source_identity": "KC/b.md", "score": 0.8518,
+ "scores": {"semantic": 0.7518, "metadata_boost": 0.1, "final": 0.8518},
+ "matched_filters": [{"field": "project", "op": "eq", "value": "knowledge-cortex"}],
+ "matched_preferences": [{"field": "project", "op": "eq", "value": "knowledge-cortex", "weight": 0.1, "match": 1.0, "contribution": 0.1}],
+ "metadata": {"…every payload field except text…": "…"}}
+```
+
+**Latency** (live Qdrant, 7-point collection, 10 searches): the query embedding took a median of about 48 ms (about 250 ms on the first, cold call), the Qdrant query about 4 ms, and reranking about 0.04 ms, for a median total of about 55 ms. Embedding dominates, so no cache was added.
+
+**Limitations.** Candidates are ranked by the pool Qdrant returns (bounded). There is no lexical/BM25 signal and no recency decay curve (only a date-range preference). `project`/`tags`/`doc_date` are absent on chunks indexed before filter metadata existed (see backfilling above). Filtered and unfiltered Qdrant queries can differ in the 4th decimal of cosine scores, because they take different search paths; repeated identical searches are byte-identical.
+
 ### Changing embedding models
 
 Do not mix vectors from different embedding models in the same collection. If the embedding model changes later, use a new `QDRANT_COLLECTION` name — `VectorStore.ensure_collection` checks the collection's vector size before indexing and raises a clear error on a mismatch instead of silently corrupting the collection.
@@ -478,6 +557,7 @@ Tools exposed:
 | Tool | Purpose |
 |---|---|
 | `semantic_search(query, limit=5, source=None, project=None, tags=None, tag_mode="all", date_from="", date_to="")` | Search the vector index, optionally filtered by metadata (see above); returns ranked chunks with path, text, score, and metadata as JSON (or `{"error": ...}` for invalid filters) |
+| `hybrid_search(query="", limit=10, filters=None, prefer=None, max_per_source=0, include_scores=true)` | Hybrid retrieval (see "Hybrid retrieval"): hard `filters` and soft `prefer` objects using the metadata field contract, optional per-source cap; returns the full response JSON with per-result score breakdown and provenance (`include_scores=false` drops the breakdown), or `{"error": ...}`. An empty query is metadata-only listing and needs a filter. Raw Qdrant filter JSON is never accepted. |
 | `sync_vault(root="", full=false)` | Index/re-index vault notes into Qdrant; incremental unless `full=true` |
 | `index_status()` | Report collection name, point count, and embedding model in use |
 
@@ -503,7 +583,7 @@ Verify with `hermes mcp test knowledge_cortex`, then `/reload-mcp` in an active 
 python -m unittest discover -s tests -v
 ```
 
-325 tests cover metadata filters (frontmatter/tag/date extraction, filtered search by source/project/tags/date ranges, local-file payload backfill without re-embedding, MCP filter pass-through), chunking (splitting/reconstruction/ID stability/metadata merging), the vector store (upsert/search/reindex/dimension-mismatch/idempotency/metadata payloads, against an in-memory Qdrant instance and a fake Ollama client — no live services required), the Obsidian vault walker (nested directories, exclusion filtering, no infinite loops), the vault sync orchestrator (first run, unchanged-skip, changed-reindex, error isolation), local-file ingestion (single file, recursive directory, unchanged/changed/no-orphans, unsupported files, one-bad-file-does-not-abort-batch, source metadata), namespaced sync-state persistence (vault/local isolation, legacy-format migration), AI structuring (invocation, structured text reaching the store, provenance metadata, safe fallback on request failure, safe fallback on empty/invalid output, incremental skip/reprocess on source-change/flag-toggle/model-change, directory ingestion with structuring enabled, configurable timeout precedence, failed-attempt retry semantics, ai_structured metadata correctness), managed vault write-back (create/conflict/safe-update/human-edit-detection/skip-on-unchanged/frontmatter-provenance/hash-excludes-frontmatter/already-in-sync rebaseline that never drops non-cortex frontmatter, all against an in-memory fake Obsidian client), the read-only reverse-sync analyzer (all 8 classifications, diff generation and truncation, precedence, zero-writes-to-vault/source/state, multiple-notes-in-one-run, one-invalid-note-does-not-block-others, legacy-state safe classification), durable change proposals (deterministic ID derivation and drift-sensitivity, idempotent regeneration, atomic writes, round-tripping, malformed/unsupported-schema-version safe failure, staleness detection on source/vault/note drift, terminal-decision immutability in both directions, zero writes to source/vault/Qdrant/sync_state on approval or rejection), the apply layer (exact reviewed body into `.md`/`.txt`, source-frontmatter preservation, no Cortex-frontmatter leakage, unsupported types/classifications/AI-structured refused with zero writes, pending/rejected/stale refused, source/vault/baseline drift after approval refused and marked stale, tampered proposals refused, dry run writes nothing, exact non-overwriting backups, atomic-write/fsync/read-only-directory/backup/intent failures leave the source intact with no temp files, post-write verification, apply metadata, no sync_state/Qdrant/vault writes, drift observed by the analyzer and re-ingestion afterwards, mode preservation, partial-transaction recovery without a second write, idempotent re-apply, round-trip guard), post-apply reconciliation (verbatim native `.md`/`.txt` bodies, source frontmatter as metadata, PDF/DOCX bodies unchanged, one-time legacy-contract reprocess, `vault_write` relationship kept with stale outcome reset, unedited outdated note classified `SOURCE_CHANGED`, apply → re-ingest → `IN_SYNC` → rebaseline without conflict, later human edits and source changes handled normally), and the `main.py` CLI (default extract-only path unchanged, `--index` path indexing + optional Markdown write + incremental state + nonzero exit on errors, `--ai-structure` parser validation and plumbing, existing-vault-note protection, source file never modified, `--write-vault` opt-in/conflict-reporting/custom-destination, `--analyze-vault` zero-writes/JSON-output/source-filter, full propose/approve/reject/list/show lifecycle).
+368 tests cover metadata filters (frontmatter/tag/date extraction, filtered search by source/project/tags/date ranges, local-file payload backfill without re-embedding, MCP filter pass-through), chunking (splitting/reconstruction/ID stability/metadata merging), the vector store (upsert/search/reindex/dimension-mismatch/idempotency/metadata payloads, against an in-memory Qdrant instance and a fake Ollama client — no live services required), the Obsidian vault walker (nested directories, exclusion filtering, no infinite loops), the vault sync orchestrator (first run, unchanged-skip, changed-reindex, error isolation), local-file ingestion (single file, recursive directory, unchanged/changed/no-orphans, unsupported files, one-bad-file-does-not-abort-batch, source metadata), namespaced sync-state persistence (vault/local isolation, legacy-format migration), AI structuring (invocation, structured text reaching the store, provenance metadata, safe fallback on request failure, safe fallback on empty/invalid output, incremental skip/reprocess on source-change/flag-toggle/model-change, directory ingestion with structuring enabled, configurable timeout precedence, failed-attempt retry semantics, ai_structured metadata correctness), managed vault write-back (create/conflict/safe-update/human-edit-detection/skip-on-unchanged/frontmatter-provenance/hash-excludes-frontmatter/already-in-sync rebaseline that never drops non-cortex frontmatter, all against an in-memory fake Obsidian client), the read-only reverse-sync analyzer (all 8 classifications, diff generation and truncation, precedence, zero-writes-to-vault/source/state, multiple-notes-in-one-run, one-invalid-note-does-not-block-others, legacy-state safe classification), durable change proposals (deterministic ID derivation and drift-sensitivity, idempotent regeneration, atomic writes, round-tripping, malformed/unsupported-schema-version safe failure, staleness detection on source/vault/note drift, terminal-decision immutability in both directions, zero writes to source/vault/Qdrant/sync_state on approval or rejection), the apply layer (exact reviewed body into `.md`/`.txt`, source-frontmatter preservation, no Cortex-frontmatter leakage, unsupported types/classifications/AI-structured refused with zero writes, pending/rejected/stale refused, source/vault/baseline drift after approval refused and marked stale, tampered proposals refused, dry run writes nothing, exact non-overwriting backups, atomic-write/fsync/read-only-directory/backup/intent failures leave the source intact with no temp files, post-write verification, apply metadata, no sync_state/Qdrant/vault writes, drift observed by the analyzer and re-ingestion afterwards, mode preservation, partial-transaction recovery without a second write, idempotent re-apply, round-trip guard), post-apply reconciliation (verbatim native `.md`/`.txt` bodies, source frontmatter as metadata, PDF/DOCX bodies unchanged, one-time legacy-contract reprocess, `vault_write` relationship kept with stale outcome reset, unedited outdated note classified `SOURCE_CHANGED`, apply → re-ingest → `IN_SYNC` → rebaseline without conflict, later human edits and source changes handled normally), hybrid retrieval (semantic-only equivalence with `store.search`, eq/any-of/contains/contains-all/boolean/date filters, invalid field/operator/value rejection before embedding, hard filters removing semantically strong results, bounded soft boosts and exact score composition, candidate-pool promotion, deterministic ranking and tie-breaking, provenance and intact metadata, stable JSON, diversity on/off, legacy/missing/malformed payloads, empty and missing collections, limit handling, metadata-only listing and truncation, non-cosine refusal, idempotent explicit index creation, no client creation on import, read-only Qdrant use, MCP `semantic_search` + `hybrid_search`, CLI), and the `main.py` CLI (default extract-only path unchanged, `--index` path indexing + optional Markdown write + incremental state + nonzero exit on errors, `--ai-structure` parser validation and plumbing, existing-vault-note protection, source file never modified, `--write-vault` opt-in/conflict-reporting/custom-destination, `--analyze-vault` zero-writes/JSON-output/source-filter, full propose/approve/reject/list/show lifecycle).
 
 ## Roadmap
 
@@ -530,7 +610,7 @@ python -m unittest discover -s tests -v
 - [x] Apply layer: consume an approved proposal and actually perform the reverse write (`ingest/apply.py`, `main.py --apply-proposal [--dry-run]`) — approved `HUMAN_MODIFIED` proposals only, `.md`/`.txt` sources only, exact reviewed body, full three-authority revalidation before writing, backup + atomic replace + post-write verification, `applied` status with an honest partial-transaction recovery contract. Never writes the vault, Qdrant, or sync_state.json.
 - [x] Post-apply reconciliation — native `.md`/`.txt` bodies round-trip verbatim through ingestion (`ingest/markdown.document_body`; PDF/DOCX unchanged), `vault_write.dest_path` survives re-ingestion with the stale write outcome reset, an unedited-but-outdated note is `SOURCE_CHANGED` rather than `HUMAN_MODIFIED`, and `--write-vault` re-baselines (never rewrites) a note that already equals the generated body, so an applied edit converges to `IN_SYNC` with no false conflict
 - [ ] Full bidirectional sync (vault → source-file reverse sync, automatic conflict merge, rename/delete propagation)
-- [ ] Hybrid retrieval combining vectors and metadata
+- [x] Hybrid retrieval combining vectors and metadata (`graph/retrieval.py`, `main.py --search`, MCP `hybrid_search`) — native Qdrant hard filters over the audited payload fields, bounded transparent soft-preference boosts (`final = semantic + min(Σ w·match, 0.10)`), deterministic tie-breaking, bounded candidate pool, optional per-source diversity, metadata-only listing, score breakdown/provenance per result, explicit idempotent `--create-payload-indexes`; `semantic_search`/`store.search` unchanged
 
 ### Phase 4: Cognitive Infrastructure
 - [ ] Knowledge synthesis

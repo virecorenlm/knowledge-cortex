@@ -23,7 +23,9 @@ python main.py --analyze-vault [--json] [--source PATH]
 python main.py --propose-vault-changes | --list-proposals | --show-proposal ID
 python main.py --approve-proposal ID | --reject-proposal ID [--decision-note "..."]
 python main.py --apply-proposal ID [--dry-run] [--backup-dir DIR]
-python mcp_server.py [--http --port 8770]              # exposes semantic_search / sync_vault / index_status
+python main.py --search "QUERY" [--filter JSON] [--prefer JSON] [--tag T] [--max-per-source N] [--json]
+python main.py --create-payload-indexes                # explicit, idempotent
+python mcp_server.py [--http --port 8770]              # exposes semantic_search / hybrid_search / sync_vault / index_status
 ```
 
 Runtime config is env-only: `OLLAMA_URL`, `EMBEDDING_MODEL` (default `qwen3-embedding:4b`), `QDRANT_URL`, `QDRANT_COLLECTION`, `QDRANT_API_KEY`, `OBSIDIAN_MCP_URL`, `OBSIDIAN_MCP_AUTHORIZATION`, `AI_STRUCTURE_MODEL`, `AI_STRUCTURE_TIMEOUT_SECONDS`. `config.yaml` is empty/unused.
@@ -33,6 +35,7 @@ Runtime config is env-only: `OLLAMA_URL`, `EMBEDDING_MODEL` (default `qwen3-embe
 Pipeline: source (Obsidian vault over MCP, or local PDF/DOCX/TXT/MD) → extract → chunk → embed via Ollama → upsert into Qdrant. Both vault sync and local ingestion share the same `graph/store.py:VectorStore` and `ingest/chunk.py`.
 
 - **`graph/store.py` `VectorStore`** — the only Ollama+Qdrant layer. Reads env at construction, and accepts injected `ollama_client`/`qdrant_client`. `ensure_collection` refuses a vector-size mismatch; use a new collection when the embedding model changes. (`graph/autolink.py` is legacy and not imported anywhere.)
+- **`graph/retrieval.py` `hybrid_search`** owns retrieval policy; `VectorStore` keeps all Qdrant access. Hard filters compile to native Qdrant filters over the audited fields only (`source`, `project`, `tags`, `path`, `source_file`, `ai_structured` where missing counts as false, and `doc_date`). Soft preferences give `final = semantic + min(Σ weight·match, max_total_boost)`. All tuning values live in `RankingConfig`; don't scatter constants. It is read-only and must never create indexes or collections. `store.search` and MCP `semantic_search` stay backward compatible.
 - **`ingest/chunk.py`** — chunk IDs are derived from `(path, sha256, chunk_index)`. Re-indexing a document deletes its old chunks by path and then upserts, so unchanged content is a no-op and nothing is left orphaned.
 - **`sync_cli.py`** owns the `sync_state.json` format: `load_state/save_state(path, namespace=...)`. There are two namespaces: `"vault"` (vault sync, `{path: sha256}`) and `"local"` (local ingestion; richer per-file records including cached `generated_body` and `vault_write`). The legacy flat format is migrated into `"vault"`. `main.py` and `mcp_server.py` import these helpers from `sync_cli`.
 - **`ingest/sync.py`** — `sync_vault_to_index` (async, over `ingest/obsidian_client.py`) and `index_local_path` (local files). Callers handle persistence. An error in one file is recorded and skipped without aborting the batch, and that file's state is not updated, so it is retried next run.

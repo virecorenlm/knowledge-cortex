@@ -22,6 +22,16 @@ PAYLOAD_INDEXES = {
     "doc_date": models.PayloadSchemaType.DATETIME,
 }
 
+# Extra keyword/bool indexes useful for graph/retrieval.py hard filters.
+# Unlike PAYLOAD_INDEXES (created on the write path by ensure_collection),
+# these are only ever created explicitly, via ensure_retrieval_indexes()
+# (main.py --create-payload-indexes).
+RETRIEVAL_PAYLOAD_INDEXES = {
+    **PAYLOAD_INDEXES,
+    "source_file": models.PayloadSchemaType.KEYWORD,
+    "ai_structured": models.PayloadSchemaType.BOOL,
+}
+
 FILTER_KEYS = {"source", "project", "tags", "tag_mode", "date_from", "date_to"}
 
 
@@ -204,19 +214,60 @@ class VectorStore:
 
         filters: optional dict restricting results by source/project/tags/
         dates — see build_search_filter. Invalid filters raise ValueError
-        before anything is embedded.
+        before anything is embedded. (graph/retrieval.py builds hybrid
+        filtering/ranking on top of the same primitives.)
         """
         query_filter = build_search_filter(filters)
+        vector = self.embed_query(query_text, instruct=instruct)
+        return [
+            {"score": r.score, **(r.payload or {})}
+            for r in self.query_points(vector, query_filter=query_filter, limit=limit)
+        ]
+
+    def embed_query(self, query_text, instruct=None):
         text = query_text if instruct is None else f"Instruct: {instruct}\nQuery:{query_text}"
-        vector = self.embed([text])[0]
-        results = self.client.query_points(
+        return self.embed([text])[0]
+
+    def query_points(self, vector, query_filter=None, limit=5):
+        """Read-only nearest-neighbour query; returns Qdrant ScoredPoints."""
+        return self.client.query_points(
             collection_name=self.collection, query=vector, query_filter=query_filter,
             limit=limit, with_payload=True,
         ).points
-        return [
-            {"score": r.score, **(r.payload or {})}
-            for r in results
-        ]
+
+    def scroll_points(self, query_filter=None, limit=100):
+        """Read-only filtered scan (point-id order); returns (points, next_offset)."""
+        return self.client.scroll(collection_name=self.collection, scroll_filter=query_filter,
+                                  limit=limit, with_payload=True, with_vectors=False)
+
+    def collection_exists(self):
+        return self.client.collection_exists(self.collection)
+
+    def distance(self):
+        """The collection's vector distance metric name (e.g. "Cosine")."""
+        vectors = self.client.get_collection(self.collection).config.params.vectors
+        metric = getattr(vectors, "distance", None)
+        return getattr(metric, "value", metric)
+
+    def ensure_retrieval_indexes(self):
+        """Explicitly create any missing RETRIEVAL_PAYLOAD_INDEXES on an
+        EXISTING collection (never creates the collection). Idempotent:
+        fields already indexed are reported, not recreated. Returns
+        {"created": [...], "existing": [...]}."""
+        if not self.collection_exists():
+            raise RuntimeError(f"Qdrant collection '{self.collection}' does not exist; index something first")
+        schema = self.client.get_collection(self.collection).payload_schema or {}
+        report = {"created": [], "existing": []}
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", message="Payload indexes have no effect")
+            for field, field_schema in RETRIEVAL_PAYLOAD_INDEXES.items():
+                if field in schema:
+                    report["existing"].append(field)
+                    continue
+                self.client.create_payload_index(collection_name=self.collection, field_name=field,
+                                                 field_schema=field_schema, wait=True)
+                report["created"].append(field)
+        return report
 
     def index_document(self, path, text, source="obsidian", max_chars=1200, metadata=None):
         """Reindex one document: replace ALL of its existing chunks with a

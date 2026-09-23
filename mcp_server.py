@@ -62,6 +62,41 @@ def semantic_search(query: str, limit: int = 5, source: list[str] | None = None,
 
 
 @server.tool()
+def hybrid_search(query: str = "", limit: int = 10, filters: dict | None = None, prefer: dict | None = None,
+                  max_per_source: int = 0, include_scores: bool = True) -> str:
+    """Hybrid search over the Knowledge Cortex index: semantic similarity plus
+    metadata. Returns a JSON object with "results" (ranked chunks with text,
+    path/source_file/chunk_index provenance, metadata, and why they matched).
+
+    filters (hard; every condition must match), fields and forms:
+      source: "obsidian"|"local_ingest" or a list (any-of)
+      project, path, source_file: a string (equality) or a list (any-of)
+      tags: "a" (contains), ["a","b"] (contains any), {"contains_all": ["a","b"]}
+      ai_structured: true|false (vault notes count as false)
+      doc_date: {"gte": "2024-01-01", "lte": "2024-12-31"} (ISO dates, inclusive days)
+    prefer (soft; boosts rank, never excludes): same fields/forms, optionally
+      {"value": ..., "weight": 0.0-0.1}; the total boost is capped at 0.1
+      cosine points, so a much more relevant chunk still wins.
+    query may be empty for metadata-only listing (then filters are required).
+    max_per_source: cap chunks per source file/note (0 = no cap).
+    include_scores: include semantic/boost/final score breakdown."""
+    from graph.retrieval import hybrid_search as run_hybrid_search, to_json
+    try:
+        response = run_hybrid_search(
+            _store(), query, limit=limit, filters=filters, prefer=prefer,
+            max_per_source=max_per_source or None,
+            instruct="Given a web search query, retrieve relevant passages that answer the query",
+        )
+    except ValueError as exc:
+        return json.dumps({"error": str(exc)}, ensure_ascii=False)
+    if not include_scores:
+        for result in response["results"]:
+            result.pop("scores", None)
+            result.pop("matched_preferences", None)
+    return to_json(response)
+
+
+@server.tool()
 async def sync_vault(root: str = "", full: bool = False) -> str:
     """Index (or re-index) notes from the Obsidian vault into the Qdrant
     semantic index. Incremental by default (skips unchanged notes via saved

@@ -375,6 +375,89 @@ def apply_proposal_cli(proposal_id, proposals_dir=None, state_path=None, dry_run
     return 0 if result["ok"] else 1
 
 
+def search_cli(query, limit=10, filters=None, prefer=None, max_per_source=None, json_output=False,
+               timings=False, store=None):
+    """Entry point for `--search`: hybrid retrieval over the Qdrant index
+    (graph/retrieval.py). Read-only. Returns 0, or 1 on invalid arguments."""
+    import json as json_module
+    from graph.retrieval import hybrid_search, to_json
+    from graph.store import VectorStore
+
+    store = store or VectorStore()
+    try:
+        response = hybrid_search(store, query, limit=limit, filters=filters, prefer=prefer,
+                                 max_per_source=max_per_source, with_timings=timings)
+    except ValueError as exc:
+        if json_output:
+            print(json_module.dumps({"error": str(exc)}))
+        else:
+            print(f"ERROR: {exc}")
+        return 1
+    if json_output:
+        print(to_json(response))
+        return 0
+    print(f"{response['mode']} search in '{response['collection']}': {len(response['results'])} result(s)"
+          f" (candidate pool {response['candidate_limit']}{', truncated' if response['truncated'] else ''})")
+    for r in response["results"]:
+        s = r["scores"]
+        semantic = "n/a" if s["semantic"] is None else f"{s['semantic']:.4f}"
+        print(f"{r['rank']:>3}. {s['final']:.4f} (semantic {semantic} + boost {s['metadata_boost']:.4f})  "
+              f"{r['path']}#{r['chunk_index']}")
+        if r.get("source_file"):
+            print(f"     source_file: {r['source_file']}")
+        meta = r["metadata"]
+        print(f"     project: {meta.get('project')}  tags: {meta.get('tags')}  doc_date: {meta.get('doc_date')}")
+        for p in r["matched_preferences"]:
+            print(f"     preferred {p['field']} {p['op']} {p['value']}: +{p['contribution']:.4f}")
+        snippet = " ".join(r["text"].split())[:160]
+        print(f"     {snippet}")
+    if timings:
+        print(f"timings (ms): {response['timings_ms']}")
+    return 0
+
+
+def create_payload_indexes_cli(store=None):
+    """Entry point for `--create-payload-indexes`: explicitly create any
+    missing retrieval payload indexes on the existing collection."""
+    from graph.store import VectorStore
+    store = store or VectorStore()
+    try:
+        report = store.ensure_retrieval_indexes()
+    except RuntimeError as exc:
+        print(f"ERROR: {exc}")
+        return 1
+    print(f"Collection '{store.collection}': created {report['created'] or 'none'}; "
+          f"already present {report['existing'] or 'none'}")
+    return 0
+
+
+def _search_arguments(args, parser):
+    import json as json_module
+    filters, prefer = {}, {}
+    for flag, target in (("filter_json", filters), ("prefer_json", prefer)):
+        raw = getattr(args, flag)
+        if raw:
+            try:
+                value = json_module.loads(raw)
+            except ValueError as exc:
+                parser.error(f"--{flag.split('_')[0]} must be a JSON object: {exc}")
+            if not isinstance(value, dict):
+                parser.error(f"--{flag.split('_')[0]} must be a JSON object")
+            target.update(value)
+    shortcuts = [
+        (filters, "project", args.filter_project), (filters, "source", args.filter_source),
+        (filters, "tags", {"contains_all": args.tag} if args.tag else None),
+        (prefer, "project", args.prefer_project), (prefer, "tags", args.prefer_tag),
+    ]
+    for target, field, value in shortcuts:
+        if not value:
+            continue
+        if field in target:
+            parser.error(f"'{field}' is given both as a shortcut flag and in the JSON object")
+        target[field] = value[0] if isinstance(value, list) and len(value) == 1 and field != "tags" else value
+    return filters or None, prefer or None
+
+
 def list_proposals_cli(proposals_dir=None, json_output=False):
     import json as json_module
     from ingest.proposals import list_proposals, DEFAULT_PROPOSALS_DIR
@@ -526,6 +609,32 @@ def main():
     parser.add_argument("--backup-dir", type=Path, default=None, dest="backup_dir",
                          help="With --apply-proposal: directory for pre-apply source backups "
                               "(default: apply_backups/ next to --proposals-dir, i.e. state/apply_backups/).")
+    parser.add_argument("--search", default=None, metavar="QUERY",
+                         help="Hybrid retrieval over the Qdrant index (semantic + metadata). An empty "
+                              "query (\"\") lists chunks matching the filters. Read-only. See "
+                              "graph/retrieval.py.")
+    parser.add_argument("--limit", type=int, default=10, help="With --search: number of results (default 10).")
+    parser.add_argument("--filter", default=None, dest="filter_json", metavar="JSON",
+                         help='With --search: hard filters as JSON, e.g. \'{"tags": {"contains_all": ["a"]}}\'.')
+    parser.add_argument("--prefer", default=None, dest="prefer_json", metavar="JSON",
+                         help='With --search: soft preferences as JSON, e.g. \'{"project": "x"}\'.')
+    parser.add_argument("--filter-project", action="append", default=None, dest="filter_project",
+                         help="With --search: hard project filter (repeat for any-of).")
+    parser.add_argument("--filter-source", action="append", default=None, dest="filter_source",
+                         help="With --search: hard source filter: obsidian | local_ingest (repeat for any-of).")
+    parser.add_argument("--tag", action="append", default=None,
+                         help="With --search: hard tag filter (repeat: chunk must carry ALL given tags).")
+    parser.add_argument("--prefer-project", action="append", default=None, dest="prefer_project",
+                         help="With --search: soft project preference (repeat for any-of).")
+    parser.add_argument("--prefer-tag", action="append", default=None, dest="prefer_tag",
+                         help="With --search: soft tag preference (repeat; boost scales with tags matched).")
+    parser.add_argument("--max-per-source", type=int, default=None, dest="max_per_source",
+                         help="With --search: at most this many chunks per source file/note.")
+    parser.add_argument("--timings", action="store_true",
+                         help="With --search: report embedding/Qdrant/rerank/total latency.")
+    parser.add_argument("--create-payload-indexes", action="store_true", dest="create_payload_indexes",
+                         help="Explicitly create any missing Qdrant payload indexes used by --search "
+                              "filters on the existing collection (idempotent).")
     parser.add_argument("--list-proposals", action="store_true", dest="list_proposals",
                          help="List every proposal under --proposals-dir with its status.")
     parser.add_argument("--show-proposal", default=None, dest="show_proposal",
@@ -540,6 +649,21 @@ def main():
     parser.add_argument("--state", type=Path, default=Path(__file__).with_name("sync_state.json"),
                          help="Path to the shared sync state file (default: sync_state.json)")
     args = parser.parse_args()
+
+    search_only = [name for name, value in (
+        ("--filter", args.filter_json), ("--prefer", args.prefer_json), ("--filter-project", args.filter_project),
+        ("--filter-source", args.filter_source), ("--tag", args.tag), ("--prefer-project", args.prefer_project),
+        ("--prefer-tag", args.prefer_tag), ("--max-per-source", args.max_per_source),
+        ("--timings", args.timings)) if value]
+    if search_only and args.search is None:
+        parser.error(f"{', '.join(search_only)} require(s) --search")
+    if args.search is not None:
+        filters, prefer = _search_arguments(args, parser)
+        return search_cli(args.search, limit=args.limit, filters=filters, prefer=prefer,
+                          max_per_source=args.max_per_source, json_output=args.json_output,
+                          timings=args.timings)
+    if args.create_payload_indexes:
+        return create_payload_indexes_cli()
 
     if args.dry_run and not args.apply_proposal:
         parser.error("--dry-run requires --apply-proposal")
